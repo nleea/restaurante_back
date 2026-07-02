@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Entornos
+.venv/
+venv/
+.env
+
+# Poetry (mantener poetry.lock versionado; ignorar caches)
+.cache/
+
+# Test / coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# SQLite de pruebas
+*.sqlite3
+test.db
+
+# Editores / SO
+.DS_Store
+.idea/
+.vscode/
