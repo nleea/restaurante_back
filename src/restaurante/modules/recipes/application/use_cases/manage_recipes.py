@@ -63,13 +63,19 @@ class RecipesService:
 
     # --- Ingredients -------------------------------------------------------
     async def create_ingredient(
-        self, tenant_id: uuid.UUID, name: str, unit_of_measure_id: uuid.UUID
+        self,
+        tenant_id: uuid.UUID,
+        name: str,
+        unit_of_measure_id: uuid.UUID,
+        *,
+        category: str | None = None,
     ) -> Ingredient:
         await self._require_unit(unit_of_measure_id)
         return await self._repo.create_ingredient(
             Ingredient(
                 tenant_id=tenant_id,
                 name=name,
+                category=category,
                 unit_of_measure_id=unit_of_measure_id,
             )
         )

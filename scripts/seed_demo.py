@@ -264,31 +264,32 @@ async def seed_staff(
 # name, unit, current stock, min stock — a few sit below the minimum on purpose
 # so the low-stock indicators light up.
 INGREDIENTS = [
-    ("Carne de res", "kg", Decimal("25.000"), Decimal("5.000")),
-    ("Pechuga de pollo", "kg", Decimal("15.000"), Decimal("4.000")),
-    ("Pan de hamburguesa", "und", Decimal("200.000"), Decimal("40.000")),
-    ("Pan de perro", "und", Decimal("150.000"), Decimal("30.000")),
-    ("Salchicha americana", "und", Decimal("180.000"), Decimal("36.000")),
-    ("Queso cheddar", "kg", Decimal("1.500"), Decimal("2.000")),  # below min
-    ("Queso costeño", "kg", Decimal("6.000"), Decimal("1.500")),
-    ("Tocineta", "kg", Decimal("4.000"), Decimal("1.000")),
-    ("Huevo", "und", Decimal("90.000"), Decimal("30.000")),
-    ("Tomate", "kg", Decimal("12.000"), Decimal("3.000")),
-    ("Lechuga", "kg", Decimal("6.000"), Decimal("1.500")),
-    ("Cebolla", "kg", Decimal("9.000"), Decimal("2.000")),
-    ("Papa", "kg", Decimal("40.000"), Decimal("10.000")),
-    ("Plátano verde", "kg", Decimal("18.000"), Decimal("4.000")),
-    ("Aceite vegetal", "L", Decimal("3.000"), Decimal("4.000")),  # below min
-    ("Arroz", "kg", Decimal("30.000"), Decimal("8.000")),
-    ("Camarón", "kg", Decimal("7.000"), Decimal("2.000")),
-    ("Filete de sierra", "kg", Decimal("10.000"), Decimal("3.000")),
-    ("Limón", "kg", Decimal("8.000"), Decimal("2.000")),
-    ("Azúcar", "kg", Decimal("14.000"), Decimal("3.000")),
-    ("Sal", "kg", Decimal("10.000"), Decimal("2.000")),
-    ("Café molido", "kg", Decimal("3.500"), Decimal("1.000")),
-    ("Gaseosa lata", "und", Decimal("120.000"), Decimal("24.000")),
-    ("Salsa de tomate", "L", Decimal("6.000"), Decimal("1.500")),
-    ("Mayonesa", "L", Decimal("5.000"), Decimal("1.500")),
+    # (name, unit, current, min, category)
+    ("Carne de res", "kg", Decimal("25.000"), Decimal("5.000"), "Carnes"),
+    ("Pechuga de pollo", "kg", Decimal("15.000"), Decimal("4.000"), "Carnes"),
+    ("Pan de hamburguesa", "und", Decimal("200.000"), Decimal("40.000"), "Panadería"),
+    ("Pan de perro", "und", Decimal("150.000"), Decimal("30.000"), "Panadería"),
+    ("Salchicha americana", "und", Decimal("180.000"), Decimal("36.000"), "Carnes"),
+    ("Queso cheddar", "kg", Decimal("1.500"), Decimal("2.000"), "Lácteos"),  # below min
+    ("Queso costeño", "kg", Decimal("6.000"), Decimal("1.500"), "Lácteos"),
+    ("Tocineta", "kg", Decimal("4.000"), Decimal("1.000"), "Carnes"),
+    ("Huevo", "und", Decimal("90.000"), Decimal("30.000"), "Lácteos"),
+    ("Tomate", "kg", Decimal("12.000"), Decimal("3.000"), "Verduras"),
+    ("Lechuga", "kg", Decimal("6.000"), Decimal("1.500"), "Verduras"),
+    ("Cebolla", "kg", Decimal("9.000"), Decimal("2.000"), "Verduras"),
+    ("Papa", "kg", Decimal("40.000"), Decimal("10.000"), "Verduras"),
+    ("Plátano verde", "kg", Decimal("18.000"), Decimal("4.000"), "Verduras"),
+    ("Aceite vegetal", "L", Decimal("3.000"), Decimal("4.000"), "Salsas"),  # below min
+    ("Arroz", "kg", Decimal("30.000"), Decimal("8.000"), "Granos"),
+    ("Camarón", "kg", Decimal("7.000"), Decimal("2.000"), "Pescados"),
+    ("Filete de sierra", "kg", Decimal("10.000"), Decimal("3.000"), "Pescados"),
+    ("Limón", "kg", Decimal("8.000"), Decimal("2.000"), "Verduras"),
+    ("Azúcar", "kg", Decimal("14.000"), Decimal("3.000"), "Granos"),
+    ("Sal", "kg", Decimal("10.000"), Decimal("2.000"), "Granos"),
+    ("Café molido", "kg", Decimal("3.500"), Decimal("1.000"), "Bebidas"),
+    ("Gaseosa lata", "und", Decimal("120.000"), Decimal("24.000"), "Bebidas"),
+    ("Salsa de tomate", "L", Decimal("6.000"), Decimal("1.500"), "Salsas"),
+    ("Mayonesa", "L", Decimal("5.000"), Decimal("1.500"), "Salsas"),
 ]
 
 
@@ -299,14 +300,21 @@ async def seed_supplies(
     units: dict[str, UnitOfMeasureModel],
 ) -> dict[str, IngredientModel]:
     ingredients: dict[str, IngredientModel] = {}
-    for name, unit_abbr, current, minimum in INGREDIENTS:
+    for name, unit_abbr, current, minimum, category in INGREDIENTS:
         ingredient, _ = await get_or_create(
             session,
             IngredientModel,
             tenant_id=tenant_id,
             name=name,
-            defaults={"unit_of_measure_id": units[unit_abbr].id, "is_active": True},
+            defaults={
+                "unit_of_measure_id": units[unit_abbr].id,
+                "is_active": True,
+                "category": category,
+            },
         )
+        # Idempotent touch-up: rows created before categories existed get theirs.
+        if ingredient.category != category:
+            ingredient.category = category
         ingredients[name] = ingredient
         await get_or_create(
             session,

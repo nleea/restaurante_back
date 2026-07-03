@@ -116,7 +116,7 @@ class DeliveryRunModel(Base, TenantScopedMixin, TimestampMixin):
     )
 
 
-class OrderDeliveryModel(Base, TenantScopedMixin):
+class OrderDeliveryModel(Base, TenantScopedMixin, TimestampMixin):
     """Per-order delivery record: address, geo and explicit delivery status."""
 
     __tablename__ = "order_deliveries"
@@ -149,6 +149,7 @@ class OrderDeliveryModel(Base, TenantScopedMixin):
         String(20), default="pending", nullable=False
     )
     route_position: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    notes: Mapped[str | None] = mapped_column(String(500), nullable=True)
     delivered_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

@@ -121,6 +121,44 @@ async def test_ingredient_crud(client: AsyncClient) -> None:
     assert deactivated.json()["is_active"] is False
 
 
+async def test_ingredient_category_round_trip(client: AsyncClient) -> None:
+    await _assign_role("admin")
+    headers = await _login(client)
+    unit_id = await _create_unit()
+
+    # Absent category stays null.
+    plain = await client.post(
+        "/recipes/ingredients",
+        headers=headers,
+        json={"name": "Cebolla", "unit_of_measure_id": str(unit_id)},
+    )
+    assert plain.status_code == 201
+    assert plain.json()["category"] is None
+
+    # Category is trimmed on create and survives list reads.
+    created = await client.post(
+        "/recipes/ingredients",
+        headers=headers,
+        json={"name": "Churrasco", "unit_of_measure_id": str(unit_id), "category": "  Carnes  "},
+    )
+    assert created.status_code == 201
+    assert created.json()["category"] == "Carnes"
+    ingredient_id = created.json()["id"]
+
+    listing = await client.get("/recipes/ingredients", headers=headers)
+    row = next(i for i in listing.json() if i["id"] == ingredient_id)
+    assert row["category"] == "Carnes"
+
+    # PATCH updates it.
+    patched = await client.patch(
+        f"/recipes/ingredients/{ingredient_id}",
+        headers=headers,
+        json={"category": "Proteínas"},
+    )
+    assert patched.status_code == 200
+    assert patched.json()["category"] == "Proteínas"
+
+
 async def test_ingredient_unknown_unit_404(client: AsyncClient) -> None:
     await _assign_role("admin")
     headers = await _login(client)

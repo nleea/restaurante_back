@@ -12,6 +12,7 @@ class Ingredient:
     tenant_id: uuid.UUID
     name: str
     unit_of_measure_id: uuid.UUID
+    category: str | None = None
     is_active: bool = True
     id: uuid.UUID | None = None
 

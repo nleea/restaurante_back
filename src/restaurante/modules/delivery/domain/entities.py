@@ -68,5 +68,8 @@ class OrderDelivery:
     longitude: Decimal | None = None
     delivery_status: str = "pending"
     route_position: int | None = None
+    notes: str | None = None
     delivered_at: datetime | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
     id: uuid.UUID | None = None

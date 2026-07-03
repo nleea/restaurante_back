@@ -45,7 +45,7 @@ async def create_ingredient(
     payload: CreateIngredientRequest, service: RecipesServiceDep, tenant_id: TenantDep
 ) -> IngredientResponse:
     ingredient = await service.create_ingredient(
-        tenant_id, payload.name, payload.unit_of_measure_id
+        tenant_id, payload.name, payload.unit_of_measure_id, category=payload.category
     )
     return IngredientResponse.model_validate(ingredient, from_attributes=True)
 

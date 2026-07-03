@@ -50,6 +50,7 @@ class RunResponse(BaseModel):
     status: str
     departed_at: datetime | None = None
     finished_at: datetime | None = None
+    created_at: datetime | None = None
 
 
 class DeliveryResponse(BaseModel):
@@ -63,7 +64,9 @@ class DeliveryResponse(BaseModel):
     longitude: Decimal | None = None
     delivery_status: str
     route_position: int | None = None
+    notes: str | None = None
     delivered_at: datetime | None = None
+    created_at: datetime | None = None
 
 
 # --- Requests ---------------------------------------------------------------
@@ -106,6 +109,7 @@ class UpdateDeliveryAddressRequest(BaseModel):
     neighborhood: str | None = Field(default=None, max_length=100)
     latitude: Decimal | None = None
     longitude: Decimal | None = None
+    notes: str | None = Field(default=None, max_length=500)
 
 
 class CreateRunRequest(BaseModel):

@@ -99,7 +99,10 @@ def _delivery(m: OrderDeliveryModel) -> OrderDelivery:
         longitude=m.longitude,
         delivery_status=m.delivery_status,
         route_position=m.route_position,
+        notes=m.notes,
         delivered_at=m.delivered_at,
+        created_at=m.created_at,
+        updated_at=m.updated_at,
     )
 
 
@@ -333,6 +336,7 @@ class SqlAlchemyDeliveryRepository:
             longitude=delivery.longitude,
             delivery_status=delivery.delivery_status,
             route_position=delivery.route_position,
+            notes=delivery.notes,
         )
         self._session.add(model)
         try:

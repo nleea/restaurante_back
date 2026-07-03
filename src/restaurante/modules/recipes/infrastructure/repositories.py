@@ -36,6 +36,7 @@ def _ingredient(m: IngredientModel) -> Ingredient:
         id=m.id,
         tenant_id=m.tenant_id,
         name=m.name,
+        category=m.category,
         unit_of_measure_id=m.unit_of_measure_id,
         is_active=m.is_active,
     )
@@ -88,6 +89,7 @@ class SqlAlchemyRecipesRepository:
         model = IngredientModel(
             tenant_id=ingredient.tenant_id,
             name=ingredient.name,
+            category=ingredient.category,
             unit_of_measure_id=ingredient.unit_of_measure_id,
             is_active=ingredient.is_active,
         )

@@ -173,6 +173,60 @@ async def test_delivery_create_one_per_order(client: AsyncClient) -> None:
     assert dup.status_code == 409
 
 
+async def test_delivery_timestamps_and_notes(client: AsyncClient) -> None:
+    await _assign_role("admin")
+    headers = await _login(client)
+    branch_id = await _create_branch()
+    employee_id = await _create_employee(branch_id, "d9@demo.com")
+    order_id = await _create_order(branch_id, employee_id)
+
+    created = await client.post(
+        "/delivery/deliveries",
+        headers=headers,
+        json={"order_id": str(order_id), "address_text": "Calle 9 #9-99"},
+    )
+    assert created.status_code == 201
+    body = created.json()
+    assert body["created_at"] is not None
+    assert body["notes"] is None
+    delivery_id = body["id"]
+
+    # Notes round-trip through the existing PATCH.
+    patched = await client.patch(
+        f"/delivery/deliveries/{delivery_id}",
+        headers=headers,
+        json={"notes": "Timbre dañado — llamar al llegar."},
+    )
+    assert patched.status_code == 200
+    assert patched.json()["notes"] == "Timbre dañado — llamar al llegar."
+    listed = await client.get("/delivery/deliveries", headers=headers)
+    row = next(d for d in listed.json() if d["id"] == delivery_id)
+    assert row["notes"] == "Timbre dañado — llamar al llegar."
+
+    # Overlong notes are rejected and nothing changes.
+    too_long = await client.patch(
+        f"/delivery/deliveries/{delivery_id}",
+        headers=headers,
+        json={"notes": "x" * 501},
+    )
+    assert too_long.status_code == 422
+
+    # Runs expose their creation time too.
+    route_id = await _create_route(client, headers, branch_id)
+    await client.post(
+        f"/delivery/routes/{route_id}/drivers",
+        headers=headers,
+        json={"employee_id": str(employee_id)},
+    )
+    run = await client.post(
+        "/delivery/runs",
+        headers=headers,
+        json={"delivery_route_id": route_id, "employee_id": str(employee_id)},
+    )
+    assert run.status_code == 201
+    assert run.json()["created_at"] is not None
+
+
 async def test_run_requires_driver_on_route(client: AsyncClient) -> None:
     await _assign_role("admin")
     headers = await _login(client)

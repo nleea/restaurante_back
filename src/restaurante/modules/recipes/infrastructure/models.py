@@ -21,6 +21,8 @@ class IngredientModel(Base, TenantScopedMixin):
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(150), nullable=False)
+    # Free-text grouping for the inventory board's filter ("Carnes", "Lácteos", …).
+    category: Mapped[str | None] = mapped_column(String(50), nullable=True)
     unit_of_measure_id: Mapped[uuid.UUID] = mapped_column(
         Uuid,
         ForeignKey("units_of_measure.id", ondelete="RESTRICT"),
