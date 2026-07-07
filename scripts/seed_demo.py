@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any, TypeVar
 
@@ -106,7 +106,11 @@ from restaurante.modules.recipes.infrastructure.models import (
     RecipeDetailModel,
     RecipeItemModel,
 )
-from restaurante.modules.staff.infrastructure.models import EmployeeModel
+from restaurante.modules.staff.infrastructure.models import (
+    EmployeeModel,
+    PlannedShiftModel,
+    ShiftTemplateModel,
+)
 from restaurante.shared.database import SessionFactory
 from restaurante.shared.security.password import Argon2PasswordHasher
 from restaurante.shared.tenancy.models import BranchModel, TenantModel
@@ -258,6 +262,70 @@ async def seed_staff(
         )
         employees[key] = employee
     return employees
+
+
+# --- shift scheduling: recurring templates + materialized 90-day horizon -----
+# weekdays use 0=Sun..6=Sat (matches the calendar UI). One employee (driver3) is
+# left without a template on purpose — an on-call example with only rest days.
+SHIFT_PATTERNS: dict[str, tuple[list[int], time, time]] = {
+    "cashier": ([1, 2, 3, 4, 5, 6], time(9, 0), time(18, 0)),
+    "cashier2": ([1, 2, 3, 4, 5], time(8, 0), time(17, 0)),
+    "cook": ([1, 2, 3, 4, 5], time(6, 0), time(15, 0)),
+    "cook2": ([3, 4, 5, 6, 0], time(12, 0), time(21, 0)),
+    "driver1": ([1, 2, 3, 4, 5], time(10, 0), time(19, 0)),
+    "driver2": ([2, 3, 4, 5, 6], time(10, 0), time(19, 0)),
+    "waiter": ([1, 2, 3, 4, 5], time(8, 0), time(17, 0)),
+}
+
+
+async def seed_shift_templates(
+    session: AsyncSession,
+    tenant_id: Any,
+    branch_id: Any,
+    employees: dict[str, EmployeeModel],
+) -> None:
+    today = date.today()
+    horizon = today + timedelta(days=90)
+
+    def dow(d: date) -> int:
+        return (d.weekday() + 1) % 7
+
+    for key, (weekdays, start, end) in SHIFT_PATTERNS.items():
+        emp = employees.get(key)
+        if emp is None:
+            continue
+        await get_or_create(
+            session,
+            ShiftTemplateModel,
+            tenant_id=tenant_id,
+            employee_id=emp.id,
+            defaults={
+                "branch_id": branch_id,
+                "weekdays": weekdays,
+                "start_time": start,
+                "end_time": end,
+                "valid_from": today,
+                "generated_through": horizon,
+            },
+        )
+        d = today
+        while d <= horizon:
+            if dow(d) in weekdays:
+                await get_or_create(
+                    session,
+                    PlannedShiftModel,
+                    tenant_id=tenant_id,
+                    employee_id=emp.id,
+                    shift_date=d,
+                    defaults={
+                        "branch_id": branch_id,
+                        "start_time": start,
+                        "end_time": end,
+                        "status": "scheduled",
+                        "origin": "template",
+                    },
+                )
+            d += timedelta(days=1)
 
 
 # --- supplies (insumos) & inventory ------------------------------------------
@@ -1712,6 +1780,7 @@ async def seed_demo() -> None:
         units = await seed_units(session)
         city = await seed_geo(session)
         employees = await seed_staff(session, tenant.id, branch.id, staff_role.id, city.id)
+        await seed_shift_templates(session, tenant.id, branch.id, employees)
         cashier = employees["cashier"]
         cashier2 = employees["cashier2"]
         cook = employees["cook"]

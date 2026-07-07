@@ -27,6 +27,28 @@ class Employee:
 
 
 @dataclass
+class ShiftTemplate:
+    """Recurring weekly pattern for an employee — the schedule's source of truth.
+
+    `weekdays` uses 0=Sun..6=Sat (matches the calendar UI). Weekdays omitted are
+    rest days that produce no shift. `valid_until = None` means indefinite.
+    `generated_through` is the horizon watermark: shifts are materialized up to
+    this date.
+    """
+
+    tenant_id: uuid.UUID
+    branch_id: uuid.UUID
+    employee_id: uuid.UUID
+    weekdays: list[int]
+    start_time: time
+    end_time: time
+    valid_from: date
+    valid_until: date | None = None
+    generated_through: date | None = None
+    id: uuid.UUID | None = None
+
+
+@dataclass
 class PlannedShift:
     tenant_id: uuid.UUID
     branch_id: uuid.UUID
@@ -34,6 +56,30 @@ class PlannedShift:
     shift_date: date
     start_time: time
     end_time: time
+    # status: scheduled | day_off | covered | manual
+    status: str = "scheduled"
+    # origin: template | manual | coverage
+    origin: str = "manual"
+    # set when status == covered: the absent employee whose slot this fills
+    covered_by_employee_id: uuid.UUID | None = None
+    note: str | None = None
+    id: uuid.UUID | None = None
+
+
+@dataclass
+class TimeOffRequest:
+    """A day-off request with its own approve/reject lifecycle and audit trail."""
+
+    tenant_id: uuid.UUID
+    branch_id: uuid.UUID
+    employee_id: uuid.UUID
+    request_date: date
+    reason: str
+    # status: pending | approved | rejected
+    status: str = "pending"
+    decided_by: uuid.UUID | None = None
+    decided_at: datetime | None = None
+    note: str | None = None
     id: uuid.UUID | None = None
 
 

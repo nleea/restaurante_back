@@ -8,6 +8,7 @@ are translated to ``ConflictError``.
 
 from __future__ import annotations
 
+import datetime as dt
 import uuid
 from typing import Any
 
@@ -26,12 +27,16 @@ from restaurante.modules.staff.domain.entities import (
     Commission,
     Employee,
     PlannedShift,
+    ShiftTemplate,
+    TimeOffRequest,
 )
 from restaurante.modules.staff.infrastructure.models import (
     AttendanceModel,
     CommissionModel,
     EmployeeModel,
     PlannedShiftModel,
+    ShiftTemplateModel,
+    TimeOffRequestModel,
 )
 from restaurante.shared.domain.errors import ConflictError
 from restaurante.shared.tenancy.models import BranchModel
@@ -59,6 +64,40 @@ def _shift(m: PlannedShiftModel) -> PlannedShift:
         shift_date=m.shift_date,
         start_time=m.start_time,
         end_time=m.end_time,
+        status=m.status,
+        origin=m.origin,
+        covered_by_employee_id=m.covered_by_employee_id,
+        note=m.note,
+    )
+
+
+def _template(m: ShiftTemplateModel) -> ShiftTemplate:
+    return ShiftTemplate(
+        id=m.id,
+        tenant_id=m.tenant_id,
+        branch_id=m.branch_id,
+        employee_id=m.employee_id,
+        weekdays=list(m.weekdays),
+        start_time=m.start_time,
+        end_time=m.end_time,
+        valid_from=m.valid_from,
+        valid_until=m.valid_until,
+        generated_through=m.generated_through,
+    )
+
+
+def _request(m: TimeOffRequestModel) -> TimeOffRequest:
+    return TimeOffRequest(
+        id=m.id,
+        tenant_id=m.tenant_id,
+        branch_id=m.branch_id,
+        employee_id=m.employee_id,
+        request_date=m.request_date,
+        reason=m.reason,
+        status=m.status,
+        decided_by=m.decided_by,
+        decided_at=m.decided_at,
+        note=m.note,
     )
 
 
@@ -212,11 +251,65 @@ class SqlAlchemyStaffRepository:
             shift_date=shift.shift_date,
             start_time=shift.start_time,
             end_time=shift.end_time,
+            status=shift.status,
+            origin=shift.origin,
+            covered_by_employee_id=shift.covered_by_employee_id,
+            note=shift.note,
         )
         self._session.add(model)
-        await self._session.commit()
+        try:
+            await self._session.commit()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise ConflictError(
+                "Ya existe un turno para ese empleado en esa fecha."
+            ) from exc
         await self._session.refresh(model)
         return _shift(model)
+
+    async def get_shift_for_slot(
+        self, tenant_id: uuid.UUID, employee_id: uuid.UUID, shift_date: dt.date
+    ) -> PlannedShift | None:
+        stmt = select(PlannedShiftModel).where(
+            PlannedShiftModel.tenant_id == tenant_id,
+            PlannedShiftModel.employee_id == employee_id,
+            PlannedShiftModel.shift_date == shift_date,
+        )
+        model = (await self._session.execute(stmt)).scalar_one_or_none()
+        return _shift(model) if model else None
+
+    async def list_shifts_in_range(
+        self,
+        tenant_id: uuid.UUID,
+        branch_id: uuid.UUID,
+        date_from: dt.date,
+        date_to: dt.date,
+    ) -> list[PlannedShift]:
+        stmt = (
+            select(PlannedShiftModel)
+            .where(
+                PlannedShiftModel.tenant_id == tenant_id,
+                PlannedShiftModel.branch_id == branch_id,
+                PlannedShiftModel.shift_date >= date_from,
+                PlannedShiftModel.shift_date <= date_to,
+            )
+            .order_by(PlannedShiftModel.shift_date, PlannedShiftModel.start_time)
+        )
+        return [_shift(m) for m in (await self._session.execute(stmt)).scalars()]
+
+    async def delete_template_shifts_from(
+        self, tenant_id: uuid.UUID, employee_id: uuid.UUID, from_date: dt.date
+    ) -> None:
+        await self._session.execute(
+            sql_delete(PlannedShiftModel).where(
+                PlannedShiftModel.tenant_id == tenant_id,
+                PlannedShiftModel.employee_id == employee_id,
+                PlannedShiftModel.shift_date >= from_date,
+                PlannedShiftModel.status == "scheduled",
+                PlannedShiftModel.origin == "template",
+            )
+        )
+        await self._session.commit()
 
     async def _get_shift_model(
         self, tenant_id: uuid.UUID, shift_id: uuid.UUID
@@ -360,3 +453,126 @@ class SqlAlchemyStaffRepository:
             .order_by(CommissionModel.occurred_at.desc())
         )
         return [_commission(m) for m in (await self._session.execute(stmt)).scalars()]
+
+    # --- Shift templates ---------------------------------------------------
+    async def create_template(self, template: ShiftTemplate) -> ShiftTemplate:
+        model = ShiftTemplateModel(
+            tenant_id=template.tenant_id,
+            branch_id=template.branch_id,
+            employee_id=template.employee_id,
+            weekdays=template.weekdays,
+            start_time=template.start_time,
+            end_time=template.end_time,
+            valid_from=template.valid_from,
+            valid_until=template.valid_until,
+            generated_through=template.generated_through,
+        )
+        self._session.add(model)
+        try:
+            await self._session.commit()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise ConflictError(
+                "Ese empleado ya tiene una plantilla."
+            ) from exc
+        await self._session.refresh(model)
+        return _template(model)
+
+    async def get_template_for_employee(
+        self, tenant_id: uuid.UUID, employee_id: uuid.UUID
+    ) -> ShiftTemplate | None:
+        stmt = select(ShiftTemplateModel).where(
+            ShiftTemplateModel.tenant_id == tenant_id,
+            ShiftTemplateModel.employee_id == employee_id,
+        )
+        model = (await self._session.execute(stmt)).scalar_one_or_none()
+        return _template(model) if model else None
+
+    async def list_templates(
+        self, tenant_id: uuid.UUID, branch_id: uuid.UUID | None = None
+    ) -> list[ShiftTemplate]:
+        stmt = select(ShiftTemplateModel).where(
+            ShiftTemplateModel.tenant_id == tenant_id
+        )
+        if branch_id is not None:
+            stmt = stmt.where(ShiftTemplateModel.branch_id == branch_id)
+        return [_template(m) for m in (await self._session.execute(stmt)).scalars()]
+
+    async def update_template(
+        self, tenant_id: uuid.UUID, template_id: uuid.UUID, fields: dict[str, Any]
+    ) -> ShiftTemplate | None:
+        stmt = select(ShiftTemplateModel).where(
+            ShiftTemplateModel.id == template_id,
+            ShiftTemplateModel.tenant_id == tenant_id,
+        )
+        model = (await self._session.execute(stmt)).scalar_one_or_none()
+        if model is None:
+            return None
+        for key, value in fields.items():
+            setattr(model, key, value)
+        await self._session.commit()
+        await self._session.refresh(model)
+        return _template(model)
+
+    # --- Time-off requests -------------------------------------------------
+    async def create_time_off_request(
+        self, request: TimeOffRequest
+    ) -> TimeOffRequest:
+        model = TimeOffRequestModel(
+            tenant_id=request.tenant_id,
+            branch_id=request.branch_id,
+            employee_id=request.employee_id,
+            request_date=request.request_date,
+            reason=request.reason,
+            status=request.status,
+            decided_by=request.decided_by,
+            decided_at=request.decided_at,
+            note=request.note,
+        )
+        self._session.add(model)
+        await self._session.commit()
+        await self._session.refresh(model)
+        return _request(model)
+
+    async def get_time_off_request(
+        self, tenant_id: uuid.UUID, request_id: uuid.UUID
+    ) -> TimeOffRequest | None:
+        stmt = select(TimeOffRequestModel).where(
+            TimeOffRequestModel.id == request_id,
+            TimeOffRequestModel.tenant_id == tenant_id,
+        )
+        model = (await self._session.execute(stmt)).scalar_one_or_none()
+        return _request(model) if model else None
+
+    async def list_time_off_requests(
+        self,
+        tenant_id: uuid.UUID,
+        *,
+        branch_id: uuid.UUID | None = None,
+        status: str | None = None,
+    ) -> list[TimeOffRequest]:
+        stmt = select(TimeOffRequestModel).where(
+            TimeOffRequestModel.tenant_id == tenant_id
+        )
+        if branch_id is not None:
+            stmt = stmt.where(TimeOffRequestModel.branch_id == branch_id)
+        if status is not None:
+            stmt = stmt.where(TimeOffRequestModel.status == status)
+        stmt = stmt.order_by(TimeOffRequestModel.created_at.desc())
+        return [_request(m) for m in (await self._session.execute(stmt)).scalars()]
+
+    async def update_time_off_request(
+        self, tenant_id: uuid.UUID, request_id: uuid.UUID, fields: dict[str, Any]
+    ) -> TimeOffRequest | None:
+        stmt = select(TimeOffRequestModel).where(
+            TimeOffRequestModel.id == request_id,
+            TimeOffRequestModel.tenant_id == tenant_id,
+        )
+        model = (await self._session.execute(stmt)).scalar_one_or_none()
+        if model is None:
+            return None
+        for key, value in fields.items():
+            setattr(model, key, value)
+        await self._session.commit()
+        await self._session.refresh(model)
+        return _request(model)

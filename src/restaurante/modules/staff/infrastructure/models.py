@@ -13,6 +13,7 @@ from datetime import date, datetime, time
 from decimal import Decimal
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     Date,
     DateTime,
@@ -20,6 +21,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Time,
+    UniqueConstraint,
     Uuid,
     func,
 )
@@ -62,10 +64,43 @@ class EmployeeModel(Base, BranchScopedMixin):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
 
+class ShiftTemplateModel(Base, BranchScopedMixin, TimestampMixin):
+    """Recurring weekly pattern per employee — authors the generated shifts."""
+
+    __tablename__ = "shift_templates"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    employee_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid,
+        ForeignKey("employees.id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
+        index=True,
+    )
+    # 0=Sun..6=Sat; JSON so it is portable across Postgres and the sqlite test DB.
+    weekdays: Mapped[list[int]] = mapped_column(JSON, nullable=False)
+    start_time: Mapped[time] = mapped_column(Time, nullable=False)
+    end_time: Mapped[time] = mapped_column(Time, nullable=False)
+    valid_from: Mapped[date] = mapped_column(Date, nullable=False)
+    valid_until: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # Horizon watermark: shifts materialized up to this date.
+    generated_through: Mapped[date | None] = mapped_column(Date, nullable=True)
+
+
 class PlannedShiftModel(Base, BranchScopedMixin, TimestampMixin):
-    """A scheduled work shift for an employee on a given date."""
+    """A scheduled work shift for an employee on a given date.
+
+    `status` and `origin` fold day-off / coverage / manual exceptions onto the
+    shift itself. A `(tenant, employee, date)` slot is unique — coverage creates
+    a row for a *different* employee, so it never collides.
+    """
 
     __tablename__ = "planned_shifts"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "employee_id", "shift_date", name="uq_planned_shift_slot"
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     employee_id: Mapped[uuid.UUID] = mapped_column(
@@ -74,6 +109,19 @@ class PlannedShiftModel(Base, BranchScopedMixin, TimestampMixin):
     shift_date: Mapped[date] = mapped_column(Date, nullable=False)
     start_time: Mapped[time] = mapped_column(Time, nullable=False)
     end_time: Mapped[time] = mapped_column(Time, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), server_default="scheduled", nullable=False
+    )
+    origin: Mapped[str] = mapped_column(
+        String(16), server_default="manual", nullable=False
+    )
+    covered_by_employee_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey("employees.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    note: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
 
 class AttendanceModel(Base, TenantScopedMixin, TimestampMixin):
@@ -97,6 +145,28 @@ class AttendanceModel(Base, TenantScopedMixin, TimestampMixin):
     check_out_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+
+class TimeOffRequestModel(Base, BranchScopedMixin, TimestampMixin):
+    """A day-off request with its own approve/reject lifecycle."""
+
+    __tablename__ = "time_off_requests"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    employee_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("employees.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    request_date: Mapped[date] = mapped_column(Date, nullable=False)
+    reason: Mapped[str] = mapped_column(String(200), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), server_default="pending", nullable=False
+    )
+    # The admin user who decided; loose reference (no FK) like `commissions`.
+    decided_by: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    note: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
 
 class CommissionModel(Base, TenantScopedMixin):

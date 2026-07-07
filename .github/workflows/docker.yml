@@ -1,0 +1,53 @@
+name: Build & Push Docker
+
+# Construye y publica la imagen del backend en Docker Hub en cada push a main.
+# La version se auto-incrementa (v001, v002, ...) leyendo los tags ya existentes.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  DOCKER_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+  IMAGE_NAME: restaurante-backend
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Calcular siguiente version
+        id: version
+        run: |
+          LATEST=$(curl -fsSL "https://hub.docker.com/v2/repositories/${DOCKER_USER}/${IMAGE_NAME}/tags?page_size=100" 2>/dev/null \
+            | jq -r '.results[].name' \
+            | grep -E '^v[0-9]+$' \
+            | sed 's/v//' \
+            | sort -n | tail -1 || true)
+          [ -z "$LATEST" ] && LATEST=0
+          NEW=$((10#$LATEST + 1))
+          VERSION="v$(printf '%03d' $NEW)"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Siguiente tag: $VERSION"
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.DOCKER_USER }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+            ${{ env.DOCKER_USER }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

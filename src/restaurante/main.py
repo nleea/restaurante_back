@@ -49,6 +49,9 @@ from restaurante.modules.purchasing.infrastructure.api.router import (
 from restaurante.modules.recipes.infrastructure.api.router import (
     router as recipes_router,
 )
+from restaurante.modules.reports.infrastructure.api.router import (
+    router as reports_router,
+)
 from restaurante.modules.staff.infrastructure.api.router import router as staff_router
 from restaurante.shared.api.errors import register_exception_handlers
 from restaurante.shared.config import get_settings
@@ -101,6 +104,7 @@ def create_app() -> FastAPI:
     app.include_router(finance_router)
     app.include_router(catalog_router)
     app.include_router(audit_router)
+    app.include_router(reports_router)
 
     return app
 
