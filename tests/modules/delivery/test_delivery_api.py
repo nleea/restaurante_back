@@ -93,7 +93,13 @@ async def _create_employee(branch_id: uuid.UUID, email: str) -> uuid.UUID:
         return employee.id
 
 
-async def _create_order(branch_id: uuid.UUID, employee_id: uuid.UUID) -> uuid.UUID:
+async def _create_order(
+    branch_id: uuid.UUID,
+    employee_id: uuid.UUID,
+    kitchen_state: str = "ready",
+) -> uuid.UUID:
+    """A delivery order. Defaults to `ready` because a delivery can only be assigned once its
+    order is cooked — tests about the dispatch flow are not about the kitchen gate."""
     tenant_id, _ = await _demo_ids()
     async with SessionFactory() as session:
         order = OrderModel(
@@ -102,6 +108,7 @@ async def _create_order(branch_id: uuid.UUID, employee_id: uuid.UUID) -> uuid.UU
             channel="delivery",
             employee_id=employee_id,
             status="open",
+            kitchen_state=kitchen_state,
         )
         session.add(order)
         await session.commit()
@@ -199,7 +206,9 @@ async def test_delivery_timestamps_and_notes(client: AsyncClient) -> None:
     )
     assert patched.status_code == 200
     assert patched.json()["notes"] == "Timbre dañado — llamar al llegar."
-    listed = await client.get("/delivery/deliveries", headers=headers)
+    listed = await client.get(
+        "/delivery/deliveries", headers=headers, params={"branch_id": str(branch_id)}
+    )
     row = next(d for d in listed.json() if d["id"] == delivery_id)
     assert row["notes"] == "Timbre dañado — llamar al llegar."
 
