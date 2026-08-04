@@ -14,6 +14,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     ForeignKey,
     Numeric,
@@ -57,6 +58,11 @@ class CashSessionModel(Base, BranchScopedMixin):
     closed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    notes: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    incident: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
+    incident_note: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
 
 class CashMovementModel(Base, BranchScopedMixin, TimestampMixin):
@@ -73,5 +79,8 @@ class CashMovementModel(Base, BranchScopedMixin, TimestampMixin):
     concept: Mapped[str] = mapped_column(String(50), nullable=False)
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     method: Mapped[str] = mapped_column(String(30), nullable=False)
+    category: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default="other"
+    )
     # Loose bridge to another entity (order, expense, ...). No FK on purpose.
     reference_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)

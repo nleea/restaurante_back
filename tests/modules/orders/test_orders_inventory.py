@@ -28,6 +28,7 @@ from restaurante.modules.staff.infrastructure.models import EmployeeModel
 from restaurante.shared.database import SessionFactory
 from restaurante.shared.tenancy.models import BranchModel, TenantModel
 from tests.conftest import TEST_EMAIL, TEST_PASSWORD
+from tests.modules._cash import seed_open_cash_session
 
 
 async def _demo_ids() -> tuple[uuid.UUID, uuid.UUID]:
@@ -172,6 +173,7 @@ async def _open_order_with_item(
     variant_id: uuid.UUID,
     quantity: int = 3,
 ) -> str:
+    await seed_open_cash_session(branch_id, employee_id)
     order_id = (
         await client.post(
             "/orders",
@@ -195,6 +197,36 @@ async def _open_order_with_item(
     return order_id
 
 
+async def _open_session_and_pay(
+    client: AsyncClient,
+    headers: dict[str, str],
+    branch_id: uuid.UUID,
+    employee_id: uuid.UUID,
+    order_id: str,
+    amount: str,
+) -> None:
+    """Open a cash session for the branch and settle the order in full.
+
+    Closing an order now requires it to be paid (or fiado); these inventory tests
+    pay in full so the close proceeds and deduction runs.
+    """
+    await client.post(
+        "/cash/sessions",
+        headers=headers,
+        json={
+            "branch_id": str(branch_id),
+            "opened_by_employee_id": str(employee_id),
+            "opening_amount": "0",
+        },
+    )
+    resp = await client.post(
+        f"/orders/{order_id}/payments",
+        headers=headers,
+        json={"amount": amount, "method": "cash", "employee_id": str(employee_id)},
+    )
+    assert resp.status_code == 201, resp.text
+
+
 # --- Happy path -------------------------------------------------------------
 async def test_close_deducts_recipe_times_quantity(client: AsyncClient) -> None:
     await _assign_role("admin")
@@ -207,6 +239,9 @@ async def test_close_deducts_recipe_times_quantity(client: AsyncClient) -> None:
         client, headers, branch_id, employee_id, variant_id, quantity=3
     )
 
+    await _open_session_and_pay(
+        client, headers, branch_id, employee_id, order_id, "30000"
+    )
     close = await client.post(f"/orders/{order_id}/close", headers=headers)
     assert close.status_code == 200
 
@@ -239,6 +274,9 @@ async def test_insufficient_stock_goes_negative(client: AsyncClient) -> None:
         client, headers, branch_id, employee_id, variant_id, quantity=3
     )
 
+    await _open_session_and_pay(
+        client, headers, branch_id, employee_id, order_id, "30000"
+    )
     close = await client.post(f"/orders/{order_id}/close", headers=headers)
     assert close.status_code == 200
     stock = await client.get(
@@ -248,17 +286,38 @@ async def test_insufficient_stock_goes_negative(client: AsyncClient) -> None:
     assert Decimal(stock.json()["current_quantity"]) == Decimal("-350")
 
 
-async def test_variant_without_recipe_consumes_nothing(client: AsyncClient) -> None:
+async def test_variant_without_recipe_cannot_be_ordered(client: AsyncClient) -> None:
+    # Safety net: a variant with no recipe (which would deduct no stock) cannot be
+    # added to an order at all, so the invariant holds at the sale boundary.
     await _assign_role("admin")
     headers = await _login(client)
     branch_id = await _create_branch()
     employee_id = await _create_employee(branch_id)
     variant_id = await _create_variant()  # no recipe created
-    order_id = await _open_order_with_item(
-        client, headers, branch_id, employee_id, variant_id, quantity=2
+    await seed_open_cash_session(branch_id, employee_id)
+    order_id = (
+        await client.post(
+            "/orders",
+            headers=headers,
+            json={
+                "branch_id": str(branch_id),
+                "channel": "takeaway",
+                "employee_id": str(employee_id),
+            },
+        )
+    ).json()["id"]
+
+    add = await client.post(
+        f"/orders/{order_id}/items",
+        headers=headers,
+        json={"product_variant_id": str(variant_id), "quantity": 2, "unit_price": "10000"},
     )
-    close = await client.post(f"/orders/{order_id}/close", headers=headers)
-    assert close.status_code == 200  # no recipe -> still closes, nothing deducted
+    assert add.status_code == 422, add.text
+    assert add.json()["code"] == "validation_error"
+
+    # Nothing was created: the order still has no items.
+    items = await client.get(f"/orders/{order_id}/items", headers=headers)
+    assert items.json() == []
 
 
 async def test_cancelled_item_not_deducted(client: AsyncClient) -> None:
@@ -270,6 +329,7 @@ async def test_cancelled_item_not_deducted(client: AsyncClient) -> None:
     ingredient_id = await _create_recipe_and_stock(
         variant_id, branch_id, recipe_qty="100", initial_stock="1000"
     )
+    await seed_open_cash_session(branch_id, employee_id)
     order_id = (
         await client.post(
             "/orders",
@@ -302,6 +362,10 @@ async def test_cancelled_item_not_deducted(client: AsyncClient) -> None:
     )
     assert active  # keep ref for clarity
 
+    # Only the active item counts toward the total (qty 1 * unit_price 1 = 1).
+    await _open_session_and_pay(
+        client, headers, branch_id, employee_id, order_id, "1"
+    )
     await client.post(f"/orders/{order_id}/close", headers=headers)
     stock = await client.get(
         f"/inventory/branches/{branch_id}/stock/{ingredient_id}", headers=headers
@@ -321,6 +385,9 @@ async def test_close_is_idempotent_for_deduction(client: AsyncClient) -> None:
         client, headers, branch_id, employee_id, variant_id, quantity=2
     )
 
+    await _open_session_and_pay(
+        client, headers, branch_id, employee_id, order_id, "20000"
+    )
     first = await client.post(f"/orders/{order_id}/close", headers=headers)
     assert first.status_code == 200
     again = await client.post(f"/orders/{order_id}/close", headers=headers)
@@ -352,6 +419,7 @@ async def test_close_updates_customer_stats(client: AsyncClient) -> None:
     variant_id = await _create_variant()
     await _create_recipe_and_stock(variant_id, branch_id)
     customer_id = await _create_customer(client, headers)
+    await seed_open_cash_session(branch_id, employee_id)
 
     order_id = (
         await client.post(
@@ -397,9 +465,12 @@ async def test_close_without_customer_leaves_stats_untouched(client: AsyncClient
     await _create_recipe_and_stock(variant_id, branch_id)
     customer_id = await _create_customer(client, headers)
 
-    # An order with no customer_id.
+    # An order with no customer_id, paid in full so the (customer-less) close is allowed.
     order_id = await _open_order_with_item(
         client, headers, branch_id, employee_id, variant_id, quantity=2
+    )
+    await _open_session_and_pay(
+        client, headers, branch_id, employee_id, order_id, "20000"
     )
     close = await client.post(f"/orders/{order_id}/close", headers=headers)
     assert close.status_code == 200

@@ -12,6 +12,8 @@ from restaurante.modules.cash.application.use_cases.manage_cash import CashServi
 from restaurante.modules.cash.infrastructure.repositories import (
     SqlAlchemyCashRepository,
 )
+from restaurante.modules.reports.application.use_cases.reporting import ReportsService
+from restaurante.modules.reports.infrastructure.api.deps import get_reports_service
 from restaurante.shared.api.deps import get_tenant_id
 from restaurante.shared.database import get_session
 
@@ -24,3 +26,4 @@ def get_cash_service(session: SessionDep) -> CashService:
 
 
 CashServiceDep = Annotated[CashService, Depends(get_cash_service)]
+ReportsServiceDep = Annotated[ReportsService, Depends(get_reports_service)]

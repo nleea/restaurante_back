@@ -10,12 +10,13 @@ non-cancelled items and discount.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import delete as sql_delete
-from sqlalchemy import func, select, update
+from sqlalchemy import exists, func, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,22 +25,31 @@ from restaurante.modules.cash.infrastructure.models import (
     CashMovementModel,
     CashSessionModel,
 )
-from restaurante.modules.customers.infrastructure.models import CustomerModel
+from restaurante.modules.customers.infrastructure.models import (
+    CustomerCreditModel,
+    CustomerModel,
+)
 from restaurante.modules.inventory.infrastructure.models import (
     InventoryMovementModel,
     InventoryStockModel,
+)
+from restaurante.modules.kitchen.infrastructure.models import (
+    OrderItemStationModel,
 )
 from restaurante.modules.menu.infrastructure.models import (
     AddonModel,
     ProductVariantModel,
 )
 from restaurante.modules.orders.domain.entities import (
+    CLAIM_PENDING,
     Cancellation,
     DiningTable,
     Order,
     OrderItem,
     OrderItemAddon,
     OrderPayment,
+    OrderPaymentClaim,
+    OrderRefund,
     ReceiptPrint,
 )
 from restaurante.modules.orders.infrastructure.models import (
@@ -48,7 +58,9 @@ from restaurante.modules.orders.infrastructure.models import (
     OrderItemAddonModel,
     OrderItemModel,
     OrderModel,
+    OrderPaymentClaimModel,
     OrderPaymentModel,
+    OrderRefundModel,
     ReceiptPrintModel,
 )
 from restaurante.modules.recipes.infrastructure.models import RecipeItemModel
@@ -81,18 +93,23 @@ def _order(m: OrderModel) -> Order:
         status=m.status,
         subtotal=m.subtotal,
         discount=m.discount,
+        delivery_fee=m.delivery_fee,
         total=m.total,
         kitchen_state=m.kitchen_state,
+        payment_method=m.payment_method,
         dining_table_id=m.dining_table_id,
         customer_id=m.customer_id,
         whatsapp_contact_id=m.whatsapp_contact_id,
+        cash_session_id=m.cash_session_id,
         closed_at=m.closed_at,
+        edit_token=m.edit_token,
+        edit_token_expires_at=m.edit_token_expires_at,
         created_at=m.created_at,
         updated_at=m.updated_at,
     )
 
 
-def _item(m: OrderItemModel) -> OrderItem:
+def _item(m: OrderItemModel, *, sent: bool = False) -> OrderItem:
     return OrderItem(
         id=m.id,
         tenant_id=m.tenant_id,
@@ -103,6 +120,8 @@ def _item(m: OrderItemModel) -> OrderItem:
         line_subtotal=m.line_subtotal,
         quantity=m.quantity,
         status=m.status,
+        notes=m.notes,
+        sent=sent,
         created_at=m.created_at,
         updated_at=m.updated_at,
     )
@@ -135,6 +154,23 @@ def _cancellation(m: CancellationModel) -> Cancellation:
     )
 
 
+def _refund(m: OrderRefundModel) -> OrderRefund:
+    return OrderRefund(
+        id=m.id,
+        tenant_id=m.tenant_id,
+        branch_id=m.branch_id,
+        order_id=m.order_id,
+        amount=m.amount,
+        method=m.method,
+        status=m.status,
+        resolved_by_employee_id=m.resolved_by_employee_id,
+        resolved_at=m.resolved_at,
+        reason=m.reason,
+        created_at=m.created_at,
+        updated_at=m.updated_at,
+    )
+
+
 def _payment(m: OrderPaymentModel) -> OrderPayment:
     return OrderPayment(
         id=m.id,
@@ -146,6 +182,23 @@ def _payment(m: OrderPaymentModel) -> OrderPayment:
         method=m.method,
         employee_id=m.employee_id,
         diner_reference=m.diner_reference,
+        created_at=m.created_at,
+    )
+
+
+def _payment_claim(m: OrderPaymentClaimModel) -> OrderPaymentClaim:
+    return OrderPaymentClaim(
+        id=m.id,
+        tenant_id=m.tenant_id,
+        branch_id=m.branch_id,
+        order_id=m.order_id,
+        amount=m.amount,
+        method=m.method,
+        proof_url=m.proof_url,
+        status=m.status,
+        rejection_reason=m.rejection_reason,
+        resolved_by_employee_id=m.resolved_by_employee_id,
+        resolved_at=m.resolved_at,
         created_at=m.created_at,
     )
 
@@ -199,6 +252,14 @@ class SqlAlchemyOrdersRepository:
         )
         return (await self._session.execute(stmt)).scalar_one_or_none() is not None
 
+    async def customer_exists(
+        self, tenant_id: uuid.UUID, customer_id: uuid.UUID
+    ) -> bool:
+        stmt = select(CustomerModel.id).where(
+            CustomerModel.id == customer_id, CustomerModel.tenant_id == tenant_id
+        )
+        return (await self._session.execute(stmt)).scalar_one_or_none() is not None
+
     async def variant_exists(
         self, tenant_id: uuid.UUID, product_variant_id: uuid.UUID
     ) -> bool:
@@ -207,6 +268,22 @@ class SqlAlchemyOrdersRepository:
             ProductVariantModel.tenant_id == tenant_id,
         )
         return (await self._session.execute(stmt)).scalar_one_or_none() is not None
+
+    async def variant_has_recipe(
+        self, tenant_id: uuid.UUID, product_variant_id: uuid.UUID
+    ) -> bool:
+        """True when the variant has ≥1 recipe item (reads the recipes table).
+
+        Follows the same cross-module read as `consume_inventory_for_order`; the
+        sale boundary is the load-bearing gate for the recipe invariant.
+        """
+        stmt = select(
+            exists().where(
+                RecipeItemModel.tenant_id == tenant_id,
+                RecipeItemModel.product_variant_id == product_variant_id,
+            )
+        )
+        return bool((await self._session.execute(stmt)).scalar())
 
     async def addon_exists(self, tenant_id: uuid.UUID, addon_id: uuid.UUID) -> bool:
         stmt = select(AddonModel.id).where(
@@ -282,12 +359,15 @@ class SqlAlchemyOrdersRepository:
             channel=order.channel,
             employee_id=order.employee_id,
             status=order.status,
+            payment_method=order.payment_method,
             subtotal=order.subtotal,
             discount=order.discount,
+            delivery_fee=order.delivery_fee,
             total=order.total,
             dining_table_id=order.dining_table_id,
             customer_id=order.customer_id,
             whatsapp_contact_id=order.whatsapp_contact_id,
+            cash_session_id=order.cash_session_id,
         )
         self._session.add(model)
         await self._session.commit()
@@ -302,6 +382,30 @@ class SqlAlchemyOrdersRepository:
         )
         return (await self._session.execute(stmt)).scalar_one_or_none()
 
+    async def set_edit_token(
+        self,
+        tenant_id: uuid.UUID,
+        order_id: uuid.UUID,
+        token: str,
+        expires_at: datetime,
+    ) -> None:
+        await self._session.execute(
+            update(OrderModel)
+            .where(OrderModel.id == order_id, OrderModel.tenant_id == tenant_id)
+            .values(edit_token=token, edit_token_expires_at=expires_at)
+        )
+        await self._session.commit()
+
+    async def get_order_by_edit_token(self, token: str) -> Order | None:
+        if not token:
+            return None
+        model = (
+            await self._session.execute(
+                select(OrderModel).where(OrderModel.edit_token == token)
+            )
+        ).scalar_one_or_none()
+        return _order(model) if model else None
+
     async def get_order(
         self, tenant_id: uuid.UUID, order_id: uuid.UUID
     ) -> Order | None:
@@ -315,6 +419,8 @@ class SqlAlchemyOrdersRepository:
         branch_id: uuid.UUID | None = None,
         status: str | None = None,
         dining_table_id: uuid.UUID | None = None,
+        open_session_only: bool = False,
+        whatsapp_contact_id: uuid.UUID | None = None,
     ) -> list[Order]:
         stmt = select(OrderModel).where(OrderModel.tenant_id == tenant_id)
         if branch_id is not None:
@@ -323,6 +429,14 @@ class SqlAlchemyOrdersRepository:
             stmt = stmt.where(OrderModel.status == status)
         if dining_table_id is not None:
             stmt = stmt.where(OrderModel.dining_table_id == dining_table_id)
+        if whatsapp_contact_id is not None:
+            stmt = stmt.where(OrderModel.whatsapp_contact_id == whatsapp_contact_id)
+        if open_session_only:
+            # Live salón scope: only orders of the branch's OPEN cash session. The join drops
+            # null-session rows and, with no open session, matches nothing.
+            stmt = stmt.join(
+                CashSessionModel, OrderModel.cash_session_id == CashSessionModel.id
+            ).where(CashSessionModel.status == "open")
         stmt = stmt.order_by(OrderModel.created_at.desc())
         return [_order(m) for m in (await self._session.execute(stmt)).scalars()]
 
@@ -390,7 +504,7 @@ class SqlAlchemyOrdersRepository:
             str((await self._session.execute(subtotal_stmt)).scalar_one())
         )
         model.subtotal = subtotal
-        model.total = subtotal - model.discount
+        model.total = subtotal - model.discount + model.delivery_fee
         await self._session.commit()
         await self._session.refresh(model)
         return _order(model)
@@ -406,6 +520,7 @@ class SqlAlchemyOrdersRepository:
             unit_price=item.unit_price,
             line_subtotal=item.line_subtotal,
             status=item.status,
+            notes=item.notes,
         )
         self._session.add(model)
         await self._session.commit()
@@ -437,7 +552,20 @@ class SqlAlchemyOrdersRepository:
             )
             .order_by(OrderItemModel.created_at)
         )
-        return [_item(m) for m in (await self._session.execute(stmt)).scalars()]
+        models = list((await self._session.execute(stmt)).scalars())
+        # An item is "sent" (en cocina) once it has ≥1 kitchen ticket. One grouped query over
+        # the order's item ids, not N+1.
+        item_ids = [m.id for m in models]
+        sent_ids: set[uuid.UUID] = set()
+        if item_ids:
+            sent_stmt = select(OrderItemStationModel.order_item_id).where(
+                OrderItemStationModel.tenant_id == tenant_id,
+                OrderItemStationModel.order_item_id.in_(item_ids),
+            )
+            sent_ids = {
+                row for row in (await self._session.execute(sent_stmt)).scalars()
+            }
+        return [_item(m, sent=m.id in sent_ids) for m in models]
 
     async def update_item(
         self, tenant_id: uuid.UUID, item_id: uuid.UUID, fields: dict[str, Any]
@@ -592,6 +720,7 @@ class SqlAlchemyOrdersRepository:
             branch_id=payment.branch_id,
             cash_session_id=payment.cash_session_id,
             type="in",
+            category="sale",
             concept="sale",
             amount=payment.amount,
             method=payment.method,
@@ -615,6 +744,246 @@ class SqlAlchemyOrdersRepository:
             .order_by(OrderPaymentModel.created_at)
         )
         return [_payment(m) for m in (await self._session.execute(stmt)).scalars()]
+
+    async def payments_total(
+        self, tenant_id: uuid.UUID, order_id: uuid.UUID
+    ) -> Decimal:
+        """Sum every payment registered for the order (0 when none)."""
+        stmt = select(func.coalesce(func.sum(OrderPaymentModel.amount), 0)).where(
+            OrderPaymentModel.tenant_id == tenant_id,
+            OrderPaymentModel.order_id == order_id,
+        )
+        return Decimal(str((await self._session.execute(stmt)).scalar_one()))
+
+    # --- Payment claims (lo que el cliente DICE que pagó) -------------------
+    # Ninguno de estos métodos toca `order_payments` ni recalcula el pedido. Es la propiedad
+    # que hace segura toda la funcionalidad: una declaración no es dinero en ninguna consulta.
+    async def create_payment_claim(
+        self, claim: OrderPaymentClaim
+    ) -> OrderPaymentClaim:
+        model = OrderPaymentClaimModel(
+            tenant_id=claim.tenant_id,
+            branch_id=claim.branch_id,
+            order_id=claim.order_id,
+            amount=claim.amount,
+            method=claim.method,
+            proof_url=claim.proof_url,
+            status=claim.status,
+        )
+        self._session.add(model)
+        await self._session.commit()
+        await self._session.refresh(model)
+        return _payment_claim(model)
+
+    async def list_payment_claims(
+        self, tenant_id: uuid.UUID, order_id: uuid.UUID
+    ) -> list[OrderPaymentClaim]:
+        stmt = (
+            select(OrderPaymentClaimModel)
+            .where(
+                OrderPaymentClaimModel.tenant_id == tenant_id,
+                OrderPaymentClaimModel.order_id == order_id,
+            )
+            .order_by(OrderPaymentClaimModel.created_at)
+        )
+        return [
+            _payment_claim(m) for m in (await self._session.execute(stmt)).scalars()
+        ]
+
+    async def count_pending_payment_claims(
+        self, tenant_id: uuid.UUID, order_id: uuid.UUID
+    ) -> int:
+        """Cuántas esperan a una persona. Sin traerse las imágenes: esto se pregunta mucho."""
+        stmt = select(func.count()).where(
+            OrderPaymentClaimModel.tenant_id == tenant_id,
+            OrderPaymentClaimModel.order_id == order_id,
+            OrderPaymentClaimModel.status == CLAIM_PENDING,
+        )
+        return int((await self._session.execute(stmt)).scalar_one())
+
+    async def get_payment_claim(
+        self, tenant_id: uuid.UUID, claim_id: uuid.UUID
+    ) -> OrderPaymentClaim | None:
+        stmt = select(OrderPaymentClaimModel).where(
+            OrderPaymentClaimModel.tenant_id == tenant_id,
+            OrderPaymentClaimModel.id == claim_id,
+        )
+        model = (await self._session.execute(stmt)).scalar_one_or_none()
+        return _payment_claim(model) if model else None
+
+    async def resolve_payment_claims(
+        self,
+        tenant_id: uuid.UUID,
+        order_id: uuid.UUID,
+        *,
+        status: str,
+        employee_id: uuid.UUID | None,
+        reason: str | None = None,
+        claim_id: uuid.UUID | None = None,
+    ) -> list[OrderPaymentClaim]:
+        """Resuelve las pendientes del pedido (o una concreta) y devuelve las que cambiaron.
+
+        Devuelve lo resuelto, no un contador, porque quien llama tiene que poder avisarle al
+        cliente de cada una — y con qué motivo.
+        """
+        filters = [
+            OrderPaymentClaimModel.tenant_id == tenant_id,
+            OrderPaymentClaimModel.order_id == order_id,
+            OrderPaymentClaimModel.status == CLAIM_PENDING,
+        ]
+        if claim_id is not None:
+            filters.append(OrderPaymentClaimModel.id == claim_id)
+        pending = list(
+            (
+                await self._session.execute(select(OrderPaymentClaimModel).where(*filters))
+            ).scalars()
+        )
+        if not pending:
+            return []
+        now = datetime.now(UTC)
+        for model in pending:
+            model.status = status
+            model.rejection_reason = reason
+            model.resolved_by_employee_id = employee_id
+            model.resolved_at = now
+        await self._session.commit()
+        return [_payment_claim(m) for m in pending]
+
+    # --- Refunds -----------------------------------------------------------
+    async def create_refund(self, refund: OrderRefund) -> OrderRefund:
+        model = OrderRefundModel(
+            tenant_id=refund.tenant_id,
+            branch_id=refund.branch_id,
+            order_id=refund.order_id,
+            amount=refund.amount,
+            method=refund.method,
+            status=refund.status,
+        )
+        self._session.add(model)
+        await self._session.commit()
+        await self._session.refresh(model)
+        return _refund(model)
+
+    async def get_refund(
+        self, tenant_id: uuid.UUID, refund_id: uuid.UUID
+    ) -> OrderRefund | None:
+        stmt = select(OrderRefundModel).where(
+            OrderRefundModel.id == refund_id, OrderRefundModel.tenant_id == tenant_id
+        )
+        row = (await self._session.execute(stmt)).scalar_one_or_none()
+        return _refund(row) if row else None
+
+    async def refund_for_order(
+        self, tenant_id: uuid.UUID, order_id: uuid.UUID
+    ) -> OrderRefund | None:
+        stmt = select(OrderRefundModel).where(
+            OrderRefundModel.order_id == order_id,
+            OrderRefundModel.tenant_id == tenant_id,
+        )
+        row = (await self._session.execute(stmt)).scalar_one_or_none()
+        return _refund(row) if row else None
+
+    async def list_refunds(
+        self,
+        tenant_id: uuid.UUID,
+        branch_id: uuid.UUID,
+        *,
+        status: str | None = None,
+    ) -> list[OrderRefund]:
+        stmt = (
+            select(OrderRefundModel)
+            .where(
+                OrderRefundModel.tenant_id == tenant_id,
+                OrderRefundModel.branch_id == branch_id,
+            )
+            .order_by(OrderRefundModel.created_at)
+        )
+        if status is not None:
+            stmt = stmt.where(OrderRefundModel.status == status)
+        return [_refund(m) for m in (await self._session.execute(stmt)).scalars()]
+
+    async def resolve_refund(
+        self,
+        tenant_id: uuid.UUID,
+        refund_id: uuid.UUID,
+        *,
+        status: str,
+        employee_id: uuid.UUID,
+        reason: str | None,
+    ) -> OrderRefund | None:
+        # Condicional sobre `pending`: dos confirmaciones simultáneas no pueden crear dos
+        # movimientos de caja por la misma devolución.
+        stmt = (
+            update(OrderRefundModel)
+            .where(
+                OrderRefundModel.id == refund_id,
+                OrderRefundModel.tenant_id == tenant_id,
+                OrderRefundModel.status == "pending",
+            )
+            .values(
+                status=status,
+                resolved_by_employee_id=employee_id,
+                resolved_at=datetime.now(UTC),
+                reason=reason,
+            )
+        )
+        result = cast("CursorResult[Any]", await self._session.execute(stmt))
+        await self._session.commit()
+        if result.rowcount == 0:
+            return None
+        return await self.get_refund(tenant_id, refund_id)
+
+    async def register_refund_movement(self, refund: OrderRefund) -> None:
+        """Salida de caja por el monto devuelto, con el método ORIGINAL.
+
+        Se apunta a la sesión abierta del momento en que se confirma, no a la del pedido: la
+        plata sale cuando alguien hace la transferencia de vuelta, y ese es el turno que debe
+        registrarlo.
+        """
+        session = await self.get_open_cash_session(refund.tenant_id, refund.branch_id)
+        if session is None or session.id is None:
+            raise ConflictError(
+                "No hay sesión de caja abierta para registrar la devolución."
+            )
+        self._session.add(
+            CashMovementModel(
+                tenant_id=refund.tenant_id,
+                branch_id=refund.branch_id,
+                cash_session_id=session.id,
+                type="out",
+                category="other",
+                concept="refund",
+                amount=refund.amount,
+                method=refund.method,
+                reference_id=refund.order_id,
+            )
+        )
+        await self._session.commit()
+
+    async def create_order_credit(
+        self,
+        tenant_id: uuid.UUID,
+        customer_id: uuid.UUID,
+        amount: Decimal,
+        order_id: uuid.UUID,
+    ) -> None:
+        """Record the unpaid remainder of a closed order as a pending customer credit.
+
+        Reaches across into the customers module's table directly (like
+        `consume_inventory_for_order` writes inventory), rather than depending on
+        the customers application service. The order's `customer_id` is already a
+        valid FK, so no existence guard is needed here.
+        """
+        self._session.add(
+            CustomerCreditModel(
+                tenant_id=tenant_id,
+                customer_id=customer_id,
+                total_amount=amount,
+                payment_status="pending",
+                reference_id=order_id,
+            )
+        )
+        await self._session.commit()
 
     # --- Inventory deduction (orders ↔ recipes ↔ inventory) ----------------
     async def consume_inventory_for_order(

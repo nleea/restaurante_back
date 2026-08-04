@@ -176,6 +176,9 @@ async def test_payment_writes_order_payment_and_cash_movement(client: AsyncClien
     assert len(sale) == 1
     assert sale[0]["type"] == "in"
     assert sale[0]["reference_id"] == order_id
+    # Category MUST be "sale" (not the default "other"), else caja double-counts it as a
+    # manual "entry" on top of sales_total.
+    assert sale[0]["category"] == "sale"
 
 
 async def test_cash_payment_reflected_in_arqueo(client: AsyncClient) -> None:
@@ -214,7 +217,16 @@ async def test_payment_without_open_session_conflicts(client: AsyncClient) -> No
     headers = await _login(client)
     branch_id = await _create_branch()
     employee_id = await _create_employee(branch_id)
+    # Opening an order now needs an open drawer; open one to create the order,
+    # then close it so the payment below still hits a *closed* session.
+    session_id = await _open_cash_session(client, headers, branch_id, employee_id)
     order_id = await _open_order(client, headers, branch_id, employee_id)
+    close = await client.post(
+        f"/cash/sessions/{session_id}/close",
+        headers=headers,
+        json={"closed_by_employee_id": str(employee_id), "counted_amount": "0"},
+    )
+    assert close.status_code == 200, close.text
 
     resp = await client.post(
         f"/orders/{order_id}/payments",

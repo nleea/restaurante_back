@@ -22,6 +22,9 @@ class CashSession:
     expected_amount: Decimal | None = None
     difference: Decimal | None = None
     closed_at: datetime | None = None
+    notes: str | None = None
+    incident: bool = False
+    incident_note: str | None = None
 
 
 @dataclass
@@ -35,3 +38,5 @@ class CashMovement:
     method: str
     id: uuid.UUID | None = None
     reference_id: uuid.UUID | None = None
+    category: str = "other"
+    created_at: datetime | None = None
