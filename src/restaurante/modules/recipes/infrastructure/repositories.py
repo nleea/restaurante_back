@@ -8,20 +8,29 @@ Uniqueness violations on a recipe line are translated to ``ConflictError``.
 from __future__ import annotations
 
 import uuid
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import delete as sql_delete
-from sqlalchemy import select
+from sqlalchemy import exists, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from restaurante.modules.catalog.infrastructure.models import UnitOfMeasureModel
-from restaurante.modules.menu.infrastructure.models import ProductVariantModel
+from restaurante.modules.kitchen.infrastructure.models import KitchenStationModel
+from restaurante.modules.menu.infrastructure.models import (
+    ProductModel,
+    ProductVariantModel,
+)
+from restaurante.modules.purchasing.infrastructure.models import (
+    PurchaseOrderItemModel,
+)
 from restaurante.modules.recipes.domain.entities import (
     Ingredient,
     RecipeCardIngredient,
     RecipeDetail,
     RecipeItem,
+    VariantMissingRecipe,
 )
 from restaurante.modules.recipes.infrastructure.models import (
     IngredientModel,
@@ -39,6 +48,8 @@ def _ingredient(m: IngredientModel) -> Ingredient:
         category=m.category,
         unit_of_measure_id=m.unit_of_measure_id,
         is_active=m.is_active,
+        is_customer_removable=m.is_customer_removable,
+        default_station_id=m.default_station_id,
     )
 
 
@@ -50,6 +61,7 @@ def _recipe_item(m: RecipeItemModel) -> RecipeItem:
         ingredient_id=m.ingredient_id,
         quantity=m.quantity,
         unit_of_measure_id=m.unit_of_measure_id,
+        station_id=m.station_id,
     )
 
 
@@ -75,6 +87,21 @@ class SqlAlchemyRecipesRepository:
         )
         return (await self._session.execute(stmt)).scalar_one_or_none() is not None
 
+    async def station_exists(
+        self, tenant_id: uuid.UUID, kitchen_station_id: uuid.UUID
+    ) -> bool:
+        """Cross-module read to kitchen, like `variant_exists` does to menu.
+
+        Checks the tenant and not the branch on purpose: the default station is a
+        tenant-level hint on the insumo, and the suggestion endpoint is the one that
+        narrows it to the branch being configured.
+        """
+        stmt = select(KitchenStationModel.id).where(
+            KitchenStationModel.id == kitchen_station_id,
+            KitchenStationModel.tenant_id == tenant_id,
+        )
+        return (await self._session.execute(stmt)).scalar_one_or_none() is not None
+
     async def variant_exists(
         self, tenant_id: uuid.UUID, product_variant_id: uuid.UUID
     ) -> bool:
@@ -84,6 +111,15 @@ class SqlAlchemyRecipesRepository:
         )
         return (await self._session.execute(stmt)).scalar_one_or_none() is not None
 
+    async def variant_is_active(
+        self, tenant_id: uuid.UUID, product_variant_id: uuid.UUID
+    ) -> bool:
+        stmt = select(ProductVariantModel.is_active).where(
+            ProductVariantModel.id == product_variant_id,
+            ProductVariantModel.tenant_id == tenant_id,
+        )
+        return bool((await self._session.execute(stmt)).scalar_one_or_none())
+
     # --- Ingredients -------------------------------------------------------
     async def create_ingredient(self, ingredient: Ingredient) -> Ingredient:
         model = IngredientModel(
@@ -92,6 +128,8 @@ class SqlAlchemyRecipesRepository:
             category=ingredient.category,
             unit_of_measure_id=ingredient.unit_of_measure_id,
             is_active=ingredient.is_active,
+            is_customer_removable=ingredient.is_customer_removable,
+            default_station_id=ingredient.default_station_id,
         )
         self._session.add(model)
         await self._session.commit()
@@ -134,6 +172,27 @@ class SqlAlchemyRecipesRepository:
         await self._session.refresh(model)
         return _ingredient(model)
 
+    async def ingredient_unit_costs(
+        self, tenant_id: uuid.UUID
+    ) -> dict[uuid.UUID, Decimal]:
+        """Moving-average of purchase unit prices per ingredient (COP per unit).
+
+        Only ingredients with at least one purchase line appear; callers treat a
+        missing ingredient as "cost unavailable" (never zero). Mirrors the costing
+        query in the reports module and assumes the purchase unit matches the
+        recipe unit (no conversion for pilots).
+        """
+        stmt = (
+            select(
+                PurchaseOrderItemModel.ingredient_id,
+                func.avg(PurchaseOrderItemModel.unit_price),
+            )
+            .where(PurchaseOrderItemModel.tenant_id == tenant_id)
+            .group_by(PurchaseOrderItemModel.ingredient_id)
+        )
+        rows = (await self._session.execute(stmt)).all()
+        return {r[0]: r[1] for r in rows if r[1] is not None}
+
     # --- Recipe items (BOM) ------------------------------------------------
     async def create_recipe_item(self, item: RecipeItem) -> RecipeItem:
         model = RecipeItemModel(
@@ -142,6 +201,7 @@ class SqlAlchemyRecipesRepository:
             ingredient_id=item.ingredient_id,
             quantity=item.quantity,
             unit_of_measure_id=item.unit_of_measure_id,
+            station_id=item.station_id,
         )
         self._session.add(model)
         try:
@@ -194,6 +254,47 @@ class SqlAlchemyRecipesRepository:
             .order_by(RecipeItemModel.id)
         )
         return [_recipe_item(m) for m in (await self._session.execute(stmt)).scalars()]
+
+    async def count_recipe_items(
+        self, tenant_id: uuid.UUID, product_variant_id: uuid.UUID
+    ) -> int:
+        stmt = select(func.count(RecipeItemModel.id)).where(
+            RecipeItemModel.tenant_id == tenant_id,
+            RecipeItemModel.product_variant_id == product_variant_id,
+        )
+        return int((await self._session.execute(stmt)).scalar_one())
+
+    async def list_active_variants_without_recipe(
+        self, tenant_id: uuid.UUID
+    ) -> list[VariantMissingRecipe]:
+        """Active variants with zero recipe items (NOT EXISTS over recipe_items)."""
+        stmt = (
+            select(
+                ProductVariantModel.id,
+                ProductVariantModel.name,
+                ProductModel.id,
+                ProductModel.name,
+            )
+            .join(ProductModel, ProductModel.id == ProductVariantModel.product_id)
+            .where(
+                ProductVariantModel.tenant_id == tenant_id,
+                ProductVariantModel.is_active.is_(True),
+                ~exists().where(
+                    RecipeItemModel.tenant_id == tenant_id,
+                    RecipeItemModel.product_variant_id == ProductVariantModel.id,
+                ),
+            )
+            .order_by(ProductModel.name, ProductVariantModel.name)
+        )
+        return [
+            VariantMissingRecipe(
+                product_variant_id=row[0],
+                variant_name=row[1],
+                product_id=row[2],
+                product_name=row[3],
+            )
+            for row in (await self._session.execute(stmt)).all()
+        ]
 
     async def update_recipe_item(
         self, tenant_id: uuid.UUID, item_id: uuid.UUID, fields: dict[str, Any]

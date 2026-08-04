@@ -10,6 +10,9 @@ from restaurante.modules.kitchen.domain.entities import (
     KitchenStation,
     OrderItemStation,
     ProductStation,
+    StationSuggestion,
+    StationTask,
+    UnroutableProduct,
 )
 
 
@@ -34,6 +37,20 @@ class OrdersReadiness(Protocol):
     async def set_order_kitchen_state(
         self, tenant_id: uuid.UUID, order_id: uuid.UUID, state: str
     ) -> None: ...
+
+
+class OrdersPaymentGate(Protocol):
+    """Outbound port: ask the orders side whether an order's money is settled enough to cook.
+
+    Prepaid orders (transfer, card, wallet) must have their payment verified before the kitchen
+    starts, so the restaurant never cooks for money it has not confirmed. Cash orders always pass:
+    their money arrives at the door.
+
+    Kept as a port, like `OrdersReadiness`, so the kitchen depends on an interface rather than on
+    the orders module.
+    """
+
+    async def may_cook(self, tenant_id: uuid.UUID, order_id: uuid.UUID) -> bool: ...
 
 
 class KitchenRepository(Protocol):
@@ -82,9 +99,27 @@ class KitchenRepository(Protocol):
         self, tenant_id: uuid.UUID, product_id: uuid.UUID
     ) -> list[ProductStation]: ...
 
+    async def variant_amounts(
+        self, tenant_id: uuid.UUID, variant_id: uuid.UUID
+    ) -> dict[uuid.UUID, str]:
+        """Cuánto lleva esa variante de cada insumo, formateado para el pase."""
+        ...
+
+    async def suggest_product_stations(
+        self, tenant_id: uuid.UUID, branch_id: uuid.UUID, product_id: uuid.UUID
+    ) -> StationSuggestion | None:
+        """Qué estaciones implica la receta del producto. ``None`` si el producto no existe."""
+        ...
+
+    async def list_unroutable_products(
+        self, tenant_id: uuid.UUID
+    ) -> list[UnroutableProduct]:
+        """Los productos que ninguna estación prepara, con sus variantes activas."""
+        ...
+
     async def list_stations_for_product(
         self, tenant_id: uuid.UUID, product_id: uuid.UUID
-    ) -> list[tuple[uuid.UUID, str | None, list[str]]]: ...
+    ) -> list[tuple[uuid.UUID, str | None, list[StationTask]]]: ...
 
     async def get_product_station(
         self, tenant_id: uuid.UUID, mapping_id: uuid.UUID
@@ -102,6 +137,12 @@ class KitchenRepository(Protocol):
     async def variant_product_id(
         self, tenant_id: uuid.UUID, variant_id: uuid.UUID
     ) -> uuid.UUID | None: ...
+
+    async def product_name(
+        self, tenant_id: uuid.UUID, product_id: uuid.UUID
+    ) -> str | None:
+        """El nombre del producto, para nombrar el que no llegó a la cocina."""
+        ...
 
     async def list_non_cancelled_items(
         self, tenant_id: uuid.UUID, order_id: uuid.UUID
@@ -129,6 +170,7 @@ class KitchenRepository(Protocol):
         station_id: uuid.UUID,
         *,
         status: str | None = None,
+        open_session_only: bool = False,
     ) -> list[OrderItemStation]: ...
 
     async def get_ticket(

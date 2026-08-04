@@ -9,6 +9,7 @@ from httpx import AsyncClient
 from scripts.seed import seed_rbac
 from sqlalchemy import select
 
+from restaurante.modules.catalog.infrastructure.models import UnitOfMeasureModel
 from restaurante.modules.identity.infrastructure.models import PersonModel, UserModel
 from restaurante.modules.identity.infrastructure.repositories import (
     SqlAlchemyRbacRepository,
@@ -22,10 +23,15 @@ from restaurante.modules.menu.infrastructure.models import (
     ProductVariantModel,
 )
 from restaurante.modules.orders.infrastructure.models import OrderItemModel, OrderModel
+from restaurante.modules.recipes.infrastructure.models import (
+    IngredientModel,
+    RecipeItemModel,
+)
 from restaurante.modules.staff.infrastructure.models import EmployeeModel
 from restaurante.shared.database import SessionFactory
 from restaurante.shared.tenancy.models import BranchModel, TenantModel
 from tests.conftest import TEST_EMAIL, TEST_PASSWORD
+from tests.modules._cash import seed_open_cash_session
 
 
 async def _demo_ids() -> tuple[uuid.UUID, uuid.UUID]:
@@ -86,6 +92,25 @@ async def _create_product_and_variant() -> tuple[uuid.UUID, uuid.UUID]:
             tenant_id=tenant_id, product_id=product.id, name="L", is_active=True
         )
         session.add(variant)
+        await session.flush()
+        # A sellable variant must have a recipe (order add-item safety net); give it one.
+        unit = UnitOfMeasureModel(name="unit", abbreviation="und")
+        session.add(unit)
+        await session.flush()
+        ingredient = IngredientModel(
+            tenant_id=tenant_id, name="Beef", unit_of_measure_id=unit.id, is_active=True
+        )
+        session.add(ingredient)
+        await session.flush()
+        session.add(
+            RecipeItemModel(
+                tenant_id=tenant_id,
+                product_variant_id=variant.id,
+                ingredient_id=ingredient.id,
+                quantity=Decimal("1"),
+                unit_of_measure_id=unit.id,
+            )
+        )
         await session.commit()
         await session.refresh(product)
         await session.refresh(variant)
@@ -143,6 +168,28 @@ async def _create_order_with_item(
         await session.refresh(order)
         await session.refresh(item)
         return order.id, item.id
+
+
+async def _add_item_to_order(
+    order_id: uuid.UUID, branch_id: uuid.UUID, variant_id: uuid.UUID
+) -> uuid.UUID:
+    """Un segundo ítem en una comanda que ya existe, para probar el caso mixto."""
+    tenant_id, _ = await _demo_ids()
+    async with SessionFactory() as session:
+        item = OrderItemModel(
+            tenant_id=tenant_id,
+            branch_id=branch_id,
+            order_id=order_id,
+            product_variant_id=variant_id,
+            quantity=1,
+            unit_price=Decimal("10000"),
+            line_subtotal=Decimal("10000"),
+            status="pending",
+        )
+        session.add(item)
+        await session.commit()
+        await session.refresh(item)
+        return item.id
 
 
 async def _create_station(
@@ -224,12 +271,12 @@ async def test_route_creates_tickets_and_is_idempotent(client: AsyncClient) -> N
 
     routed = await client.post(f"/kitchen/orders/{order_id}/route", headers=headers)
     assert routed.status_code == 201
-    assert len(routed.json()) == 1
-    assert routed.json()[0]["status"] == "pending"
+    assert len(routed.json()["tickets"]) == 1
+    assert routed.json()["tickets"][0]["status"] == "pending"
 
     # idempotent: routing again creates nothing new
     again = await client.post(f"/kitchen/orders/{order_id}/route", headers=headers)
-    assert again.json() == []
+    assert again.json()["tickets"] == []
 
     board = await client.get(
         f"/kitchen/stations/{station_id}/tickets", headers=headers
@@ -251,13 +298,15 @@ async def test_route_skips_no_station_and_cancelled(client: AsyncClient) -> None
     )
     order_id, _ = await _create_order_with_item(branch_id, variant_id, cancelled=True)
     routed = await client.post(f"/kitchen/orders/{order_id}/route", headers=headers)
-    assert routed.json() == []  # cancelled item not routed
+    assert routed.json()["tickets"] == []  # cancelled item not routed
 
-    # a second product with NO station mapping -> no ticket
+    # Un producto SIN estación: sigue sin generar ticket, pero ya no en silencio — sale
+    # nombrado en `unrouted`, que es lo que impide que un pedido cobrado se dé por enviado.
     _, variant2 = await _create_product_and_variant()
     order2, _ = await _create_order_with_item(branch_id, variant2)
     routed2 = await client.post(f"/kitchen/orders/{order2}/route", headers=headers)
-    assert routed2.json() == []
+    assert routed2.json()["tickets"] == []
+    assert routed2.json()["unrouted"], "un plato sin estación tiene que salir nombrado"
 
 
 async def test_ticket_lifecycle(client: AsyncClient) -> None:
@@ -274,7 +323,7 @@ async def test_ticket_lifecycle(client: AsyncClient) -> None:
     order_id, _ = await _create_order_with_item(branch_id, variant_id)
     ticket_id = (
         await client.post(f"/kitchen/orders/{order_id}/route", headers=headers)
-    ).json()[0]["id"]
+    ).json()["tickets"][0]["id"]
 
     a1 = await client.post(f"/kitchen/tickets/{ticket_id}/advance", headers=headers)
     assert a1.json()["status"] == "in_progress"
@@ -349,7 +398,7 @@ async def _create_employee_only(branch_id: uuid.UUID) -> uuid.UUID:
         return employee.id
 
 
-async def test_item_add_auto_routes_to_kitchen(client: AsyncClient) -> None:
+async def test_item_add_does_not_route_until_send(client: AsyncClient) -> None:
     await _assign_role("admin")
     headers = await _login(client)
     branch_id = await _create_branch()
@@ -361,6 +410,7 @@ async def test_item_add_auto_routes_to_kitchen(client: AsyncClient) -> None:
         json={"product_id": str(product_id), "kitchen_station_id": str(station_id)},
     )
     employee_id = await _create_employee_only(branch_id)
+    await seed_open_cash_session(branch_id, employee_id)
 
     order_id = (
         await client.post(
@@ -374,18 +424,18 @@ async def test_item_add_auto_routes_to_kitchen(client: AsyncClient) -> None:
         )
     ).json()["id"]
 
-    # Adding a MAPPED item auto-routes — the ticket appears with no manual /route call.
+    # Adding a MAPPED item does NOT route — no ticket until an explicit "Enviar a cocina".
     add = await client.post(
         f"/orders/{order_id}/items",
         headers=headers,
         json={"product_variant_id": str(variant_id), "quantity": 1, "unit_price": "10000"},
     )
     assert add.status_code == 201
+    assert add.json()["sent"] is False
     board = await client.get(f"/kitchen/stations/{station_id}/tickets", headers=headers)
-    assert len(board.json()) == 1
-    assert board.json()[0]["status"] == "pending"
+    assert board.json() == []
 
-    # An UNMAPPED item adds fine but creates no ticket.
+    # An UNMAPPED item adds fine too; still nothing on the board.
     _, variant2 = await _create_product_and_variant()
     add2 = await client.post(
         f"/orders/{order_id}/items",
@@ -393,12 +443,62 @@ async def test_item_add_auto_routes_to_kitchen(client: AsyncClient) -> None:
         json={"product_variant_id": str(variant2), "quantity": 1, "unit_price": "5000"},
     )
     assert add2.status_code == 201
-    board2 = await client.get(f"/kitchen/stations/{station_id}/tickets", headers=headers)
-    assert len(board2.json()) == 1  # still only the mapped item's ticket
 
-    # The manual route is now a no-op (the order is already routed, idempotent).
+    # Explicit route ("Enviar a cocina") fires the pending items — only the mapped one is ticketed.
     routed = await client.post(f"/kitchen/orders/{order_id}/route", headers=headers)
-    assert routed.json() == []
+    assert len(routed.json()["tickets"]) == 1
+    board2 = await client.get(f"/kitchen/stations/{station_id}/tickets", headers=headers)
+    assert len(board2.json()) == 1
+    assert board2.json()[0]["status"] == "pending"
+
+    # The mapped item now reports sent=true.
+    items = await client.get(f"/orders/{order_id}/items", headers=headers)
+    mapped = [i for i in items.json() if i["product_variant_id"] == str(variant_id)][0]
+    assert mapped["sent"] is True
+
+
+async def test_item_kitchen_note_reaches_the_board(client: AsyncClient) -> None:
+    await _assign_role("admin")
+    headers = await _login(client)
+    branch_id = await _create_branch()
+    station_id = await _create_station(client, headers, branch_id)
+    product_id, variant_id = await _create_product_and_variant()
+    await client.post(
+        "/kitchen/product-stations",
+        headers=headers,
+        json={"product_id": str(product_id), "kitchen_station_id": str(station_id)},
+    )
+    employee_id = await _create_employee_only(branch_id)
+    await seed_open_cash_session(branch_id, employee_id)
+    order_id = (
+        await client.post(
+            "/orders",
+            headers=headers,
+            json={
+                "branch_id": str(branch_id),
+                "channel": "takeaway",
+                "employee_id": str(employee_id),
+            },
+        )
+    ).json()["id"]
+
+    # Add the item with a kitchen note, then send to the kitchen.
+    add = await client.post(
+        f"/orders/{order_id}/items",
+        headers=headers,
+        json={
+            "product_variant_id": str(variant_id),
+            "quantity": 1,
+            "unit_price": "10000",
+            "notes": "sin lechuga, sin queso",
+        },
+    )
+    assert add.status_code == 201
+    assert add.json()["notes"] == "sin lechuga, sin queso"
+
+    await client.post(f"/kitchen/orders/{order_id}/route", headers=headers)
+    board = await client.get(f"/kitchen/stations/{station_id}/tickets", headers=headers)
+    assert board.json()[0]["notes"] == "sin lechuga, sin queso"
 
 
 async def test_item_add_without_kitchen_config_is_noop(client: AsyncClient) -> None:
@@ -408,6 +508,7 @@ async def test_item_add_without_kitchen_config_is_noop(client: AsyncClient) -> N
     # No station, no product->station mapping.
     _, variant_id = await _create_product_and_variant()
     employee_id = await _create_employee_only(branch_id)
+    await seed_open_cash_session(branch_id, employee_id)
     order_id = (
         await client.post(
             "/orders",
@@ -426,3 +527,35 @@ async def test_item_add_without_kitchen_config_is_noop(client: AsyncClient) -> N
         json={"product_variant_id": str(variant_id), "quantity": 1, "unit_price": "10000"},
     )
     assert add.status_code == 201
+
+
+async def test_a_mixed_order_cooks_what_it_can_and_names_what_it_cannot(
+    client: AsyncClient,
+) -> None:
+    """El caso que decide el diseño: una comanda con un plato configurado y otro sin estación.
+
+    Los que SÍ se pueden preparar entran igual — el cliente está esperando, y frenar la comida
+    que no tiene ningún problema no arregla la que sí. El hueco viaja con nombre propio para que
+    alguien pueda actuar en vez de descubrirlo cuando el plato no llegue.
+    """
+    await _assign_role("admin")
+    headers = await _login(client)
+    branch_id = await _create_branch()
+    station_id = await _create_station(client, headers, branch_id)
+
+    ok_product, ok_variant = await _create_product_and_variant()
+    await client.post(
+        "/kitchen/product-stations",
+        headers=headers,
+        json={"product_id": str(ok_product), "kitchen_station_id": str(station_id)},
+    )
+    _, orphan_variant = await _create_product_and_variant()
+
+    order_id, _ = await _create_order_with_item(branch_id, ok_variant)
+    await _add_item_to_order(order_id, branch_id, orphan_variant)
+
+    routed = await client.post(f"/kitchen/orders/{order_id}/route", headers=headers)
+
+    body = routed.json()
+    assert len(body["tickets"]) == 1, "el plato configurado sí entra a cocina"
+    assert len(body["unrouted"]) == 1, "y el otro sale nombrado, no en silencio"

@@ -51,7 +51,7 @@ async def _routed_ticket(
     order_id, _item_id = await _create_order_with_item(branch_id, variant_id)
     routed = await client.post(f"/kitchen/orders/{order_id}/route", headers=headers)
     assert routed.status_code == 201, routed.text
-    return station_id, routed.json()[0]["id"]
+    return station_id, routed.json()["tickets"][0]["id"]
 
 
 async def test_route_and_advance_publish_events(

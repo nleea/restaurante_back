@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from decimal import Decimal
 from typing import Any, Protocol
 
 from restaurante.modules.recipes.domain.entities import (
@@ -10,6 +11,7 @@ from restaurante.modules.recipes.domain.entities import (
     RecipeCardIngredient,
     RecipeDetail,
     RecipeItem,
+    VariantMissingRecipe,
 )
 
 
@@ -17,7 +19,15 @@ class RecipesRepository(Protocol):
     # --- Reference existence checks ----------------------------------------
     async def unit_exists(self, unit_of_measure_id: uuid.UUID) -> bool: ...
 
+    async def station_exists(
+        self, tenant_id: uuid.UUID, kitchen_station_id: uuid.UUID
+    ) -> bool: ...
+
     async def variant_exists(
+        self, tenant_id: uuid.UUID, product_variant_id: uuid.UUID
+    ) -> bool: ...
+
+    async def variant_is_active(
         self, tenant_id: uuid.UUID, product_variant_id: uuid.UUID
     ) -> bool: ...
 
@@ -36,6 +46,10 @@ class RecipesRepository(Protocol):
         self, tenant_id: uuid.UUID, ingredient_id: uuid.UUID, fields: dict[str, Any]
     ) -> Ingredient | None: ...
 
+    async def ingredient_unit_costs(
+        self, tenant_id: uuid.UUID
+    ) -> dict[uuid.UUID, Decimal]: ...
+
     # --- Recipe items (BOM) ------------------------------------------------
     async def create_recipe_item(self, item: RecipeItem) -> RecipeItem: ...
 
@@ -53,6 +67,14 @@ class RecipesRepository(Protocol):
     async def list_recipe_items(
         self, tenant_id: uuid.UUID, product_variant_id: uuid.UUID
     ) -> list[RecipeItem]: ...
+
+    async def count_recipe_items(
+        self, tenant_id: uuid.UUID, product_variant_id: uuid.UUID
+    ) -> int: ...
+
+    async def list_active_variants_without_recipe(
+        self, tenant_id: uuid.UUID
+    ) -> list[VariantMissingRecipe]: ...
 
     async def update_recipe_item(
         self, tenant_id: uuid.UUID, item_id: uuid.UUID, fields: dict[str, Any]

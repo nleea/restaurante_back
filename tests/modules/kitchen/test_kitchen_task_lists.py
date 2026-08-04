@@ -40,7 +40,10 @@ async def test_attach_with_tasks_and_default_empty(client: AsyncClient) -> None:
     headers = await _login(client)
 
     branch_id, _, _, mapping = await _mapped_product(client, headers, tasks=TASKS)
-    assert mapping["tasks"] == TASKS
+    # La respuesta es estructurada; enviarlas como cadenas sueltas (forma vieja) se sigue
+    # aceptando y se normaliza a etiquetas sin insumo, que es lo que siempre significaron.
+    assert [t["label"] for t in mapping["tasks"]] == TASKS
+    assert all(t["ingredient_id"] is None for t in mapping["tasks"])
 
     # A second product without tasks defaults to an empty list.
     station_id = await _create_station(client, headers, branch_id, name="Fríos")
@@ -67,7 +70,7 @@ async def test_patch_updates_role_and_tasks_in_place(client: AsyncClient) -> Non
     assert patched.status_code == 200, patched.text
     # trimmed and empties dropped, same mapping id (no detach/re-attach)
     assert patched.json()["id"] == mapping["id"]
-    assert patched.json()["tasks"] == TASKS
+    assert [t["label"] for t in patched.json()["tasks"]] == TASKS
     assert patched.json()["role"] == "Parrilla"
 
     renamed = await client.patch(
@@ -76,7 +79,8 @@ async def test_patch_updates_role_and_tasks_in_place(client: AsyncClient) -> Non
         json={"role": "Plancha"},
     )
     assert renamed.json()["role"] == "Plancha"
-    assert renamed.json()["tasks"] == TASKS  # untouched by a role-only patch
+    # untouched by a role-only patch
+    assert [t["label"] for t in renamed.json()["tasks"]] == TASKS
 
 
 async def test_oversized_task_list_rejected(client: AsyncClient) -> None:
@@ -109,7 +113,7 @@ async def test_routing_freezes_tasks_onto_tickets(client: AsyncClient) -> None:
 
     routed = await client.post(f"/kitchen/orders/{order_id}/route", headers=headers)
     assert routed.status_code == 201
-    assert routed.json()[0]["tasks"] == TASKS
+    assert routed.json()["tickets"][0]["tasks"] == TASKS
 
     # Editing the config never rewrites the fired ticket…
     await client.patch(
@@ -125,7 +129,7 @@ async def test_routing_freezes_tasks_onto_tickets(client: AsyncClient) -> None:
     # …but a subsequently routed order carries the new list.
     order2, _ = await _create_order_with_item(branch_id, variant_id)
     routed2 = await client.post(f"/kitchen/orders/{order2}/route", headers=headers)
-    assert routed2.json()[0]["tasks"] == ["Solo carne"]
+    assert routed2.json()["tickets"][0]["tasks"] == ["Solo carne"]
 
 
 async def test_patch_requires_permission(client: AsyncClient) -> None:

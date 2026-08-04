@@ -7,6 +7,7 @@ ready`). Routing is idempotent; advancing is a strict forward state machine.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -16,10 +17,15 @@ from restaurante.modules.kitchen.domain.entities import (
     KitchenStation,
     OrderItemStation,
     ProductStation,
+    RoutingResult,
+    StationSuggestion,
+    StationTask,
+    UnroutableProduct,
 )
 from restaurante.modules.kitchen.domain.ports import (
     KitchenEventPublisher,
     KitchenRepository,
+    OrdersPaymentGate,
     OrdersReadiness,
 )
 from restaurante.shared.domain.errors import (
@@ -27,6 +33,8 @@ from restaurante.shared.domain.errors import (
     NotFoundError,
     ValidationError,
 )
+
+logger = logging.getLogger(__name__)
 
 STATUS_PENDING = "pending"
 STATUS_IN_PROGRESS = "in_progress"
@@ -40,20 +48,53 @@ MAX_TASKS_PER_MAPPING = 10
 MAX_TASK_LENGTH = 60
 
 
-def normalize_tasks(tasks: list[str]) -> list[str]:
-    """Trim, drop empties, and bound the station task list (order preserved)."""
-    cleaned = [t.strip() for t in tasks]
-    cleaned = [t for t in cleaned if t]
+def normalize_tasks(tasks: list[StationTask]) -> list[StationTask]:
+    """Trim, drop empties, and bound the station task list (order preserved).
+
+    La etiqueta se limpia; el `ingredient_id` se conserva intacto — es lo que permite resolver la
+    cantidad por variante al enrutar, y perderlo al normalizar dejaría la tarea muda.
+    """
+    cleaned = [
+        StationTask(label=t.label.strip(), ingredient_id=t.ingredient_id)
+        for t in tasks
+    ]
+    cleaned = [t for t in cleaned if t.label]
     if len(cleaned) > MAX_TASKS_PER_MAPPING:
         raise ValidationError(
             f"Máximo {MAX_TASKS_PER_MAPPING} tareas por estación."
         )
     for task in cleaned:
-        if len(task) > MAX_TASK_LENGTH:
+        if len(task.label) > MAX_TASK_LENGTH:
             raise ValidationError(
                 f"Cada tarea debe tener como máximo {MAX_TASK_LENGTH} caracteres."
             )
     return cleaned
+
+
+def resolve_tasks(
+    tasks: list[StationTask], amounts: dict[uuid.UUID, str]
+) -> list[str]:
+    """Lo que la chit de ESTA variante va a decir.
+
+    Tres casos, y el orden importa:
+
+    - tarea sin insumo (`"Emplatar"`) → verbatim, es un paso humano;
+    - insumo que la variante SÍ lleva → etiqueta + su cantidad ("Carne de res 300 g");
+    - insumo que la variante NO lleva → se omite. Las tareas son por producto y la receta por
+      variante, así que un mapeo puede arrastrar un insumo que la sencilla lleva y la doble no.
+      Decirle al cocinero que ponga algo que ese plato no lleva es un error de comida; callarlo
+      es lo que la receta de esa variante realmente dice.
+    """
+    resolved: list[str] = []
+    for task in tasks:
+        if task.ingredient_id is None:
+            resolved.append(task.label)
+            continue
+        amount = amounts.get(task.ingredient_id)
+        if amount is None:
+            continue
+        resolved.append(f"{task.label} {amount}")
+    return resolved
 
 # Order-level kitchen readiness derived from its tickets.
 KITCHEN_STATE_NONE = "none"
@@ -81,12 +122,16 @@ class KitchenService:
         repo: KitchenRepository,
         orders_readiness: OrdersReadiness | None = None,
         events: KitchenEventPublisher | None = None,
+        orders_payment: OrdersPaymentGate | None = None,
     ) -> None:
         self._repo = repo
         # Optional outbound ports: when wired, readiness transitions are pushed to the orders
         # side and ticket changes are broadcast to live KDS boards. Both are best-effort.
         self._orders_readiness = orders_readiness
         self._events = events
+        # Unlike the two above this one is NOT best-effort: when wired it can refuse a route.
+        # An unverified prepaid order must not reach the stove.
+        self._orders_payment = orders_payment
 
     # --- internal guards ---------------------------------------------------
     async def _require_branch(
@@ -152,7 +197,7 @@ class KitchenService:
         product_id: uuid.UUID,
         station_id: uuid.UUID,
         role: str | None = None,
-        tasks: list[str] | None = None,
+        tasks: list[StationTask] | None = None,
     ) -> ProductStation:
         await self._require_product(tenant_id, product_id)
         await self._require_station(tenant_id, station_id)
@@ -193,14 +238,47 @@ class KitchenService:
     ) -> None:
         await self._repo.delete_product_station(tenant_id, product_id, station_id)
 
+    async def suggest_product_stations(
+        self, tenant_id: uuid.UUID, branch_id: uuid.UUID, product_id: uuid.UUID
+    ) -> StationSuggestion:
+        """Lo que la receta del producto propone, para que una persona lo confirme.
+
+        Estrictamente de lectura: no escribe `product_stations` por ninguna rama. Enrutar sigue
+        leyendo sólo lo guardado, así que una sugerencia que nadie acepta no mueve una comanda —
+        y editar una receta nunca reescribe una chit que ya salió.
+        """
+        suggestion = await self._repo.suggest_product_stations(
+            tenant_id, branch_id, product_id
+        )
+        if suggestion is None:
+            raise NotFoundError(f"Producto no encontrado: {product_id}")
+        return suggestion
+
     # --- Routing -----------------------------------------------------------
+    async def list_unroutable_products(
+        self, tenant_id: uuid.UUID
+    ) -> list[UnroutableProduct]:
+        """Qué no puede llegar a la cocina hoy, para verlo antes de que lo pague un cliente."""
+        return await self._repo.list_unroutable_products(tenant_id)
+
     async def route_order(
         self, tenant_id: uuid.UUID, order_id: uuid.UUID
-    ) -> list[OrderItemStation]:
+    ) -> RoutingResult:
         if not await self._repo.order_exists(tenant_id, order_id):
             raise NotFoundError(f"Orden no encontrada: {order_id}")
+        # No se cocina un prepago sin confirmar. El efectivo pasa siempre: su plata llega
+        # en la puerta.
+        if self._orders_payment is not None and not await self._orders_payment.may_cook(
+            tenant_id, order_id
+        ):
+            raise ConflictError(
+                "El pago del pedido no está verificado; verifícalo antes de enviarlo a cocina."
+            )
         items = await self._repo.list_non_cancelled_items(tenant_id, order_id)
         created: list[OrderItemStation] = []
+        # Lo que NO llegó a ninguna estación. Enrutar devolvía éxito con cero tickets y el plato
+        # quedaba cobrado y sin cocinar; ahora el hueco sale con nombre.
+        unrouted: list[str] = []
         for item_id, variant_id, branch_id in items:
             product_id = await self._repo.variant_product_id(tenant_id, variant_id)
             if product_id is None:
@@ -208,10 +286,22 @@ class KitchenService:
             station_roles = await self._repo.list_stations_for_product(
                 tenant_id, product_id
             )
+            # Una sola lectura de la receta por ítem, reutilizada en todas sus estaciones: esto
+            # es el camino crítico de la comanda.
+            amounts = await self._repo.variant_amounts(tenant_id, variant_id)
+            if not station_roles:
+                # Los demás platos SIGUEN entrando: el cliente espera, y frenar la comida que sí
+                # se puede preparar no arregla la que no.
+                name = await self._repo.product_name(tenant_id, product_id)
+                if name and name not in unrouted:
+                    unrouted.append(name)
+                continue
             for station_id, role, tasks in station_roles:
                 # Idempotent: an existing ticket keeps the role/tasks captured at first route.
                 if await self._repo.ticket_exists(tenant_id, item_id, station_id):
                     continue
+                # La cantidad de la variante PEDIDA, no la unión del producto.
+                resolved = resolve_tasks(tasks, amounts)
                 try:
                     created.append(
                         await self._repo.create_ticket(
@@ -221,7 +311,7 @@ class KitchenService:
                                 order_item_id=item_id,
                                 kitchen_station_id=station_id,
                                 role=role,
-                                tasks=tasks,
+                                tasks=resolved,
                             )
                         )
                     )
@@ -234,7 +324,14 @@ class KitchenService:
         await self._emit_kitchen_state(tenant_id, order_id)
         for ticket in created:
             await self._publish_event("ticket_created", ticket, order_id=order_id)
-        return created
+        if unrouted:
+            logger.warning(
+                "Comanda %s enrutada con %d producto(s) sin estación: %s",
+                order_id,
+                len(unrouted),
+                ", ".join(unrouted),
+            )
+        return RoutingResult(tickets=created, unrouted=unrouted)
 
     # --- Ready rollup ------------------------------------------------------
     async def _compute_kitchen_state(
@@ -292,9 +389,12 @@ class KitchenService:
         station_id: uuid.UUID,
         *,
         status: str | None = None,
+        open_session_only: bool = False,
     ) -> list[OrderItemStation]:
         await self._require_station(tenant_id, station_id)
-        return await self._repo.list_tickets(tenant_id, station_id, status=status)
+        return await self._repo.list_tickets(
+            tenant_id, station_id, status=status, open_session_only=open_session_only
+        )
 
     async def advance_ticket(
         self, tenant_id: uuid.UUID, ticket_id: uuid.UUID

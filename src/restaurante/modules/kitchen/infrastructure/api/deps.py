@@ -46,6 +46,7 @@ def get_kitchen_service(session: SessionDep) -> KitchenService:
     # Wire the orders-readiness outbound adapter over the SAME session so advancing/routing
     # tickets recomputes and persists the order's kitchen_state (and auto-dispatches delivery).
     from restaurante.modules.orders.infrastructure.api.deps import (
+        build_orders_payment_gate,
         build_orders_readiness,
     )
 
@@ -53,6 +54,8 @@ def get_kitchen_service(session: SessionDep) -> KitchenService:
         repo=SqlAlchemyKitchenRepository(session),
         orders_readiness=build_orders_readiness(session),
         events=get_event_publisher(),
+        # Refuses to route a prepaid order whose payment nobody has verified.
+        orders_payment=build_orders_payment_gate(session),
     )
 
 

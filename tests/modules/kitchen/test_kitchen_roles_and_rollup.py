@@ -14,6 +14,7 @@ from httpx import AsyncClient
 from scripts.seed import seed_rbac
 from sqlalchemy import select
 
+from restaurante.modules.catalog.infrastructure.models import UnitOfMeasureModel
 from restaurante.modules.identity.infrastructure.models import PersonModel, UserModel
 from restaurante.modules.kitchen.application.use_cases.manage_kitchen import (
     KitchenService,
@@ -33,10 +34,15 @@ from restaurante.modules.orders.infrastructure.models import OrderItemModel, Ord
 from restaurante.modules.orders.infrastructure.repositories import (
     SqlAlchemyOrdersRepository,
 )
+from restaurante.modules.recipes.infrastructure.models import (
+    IngredientModel,
+    RecipeItemModel,
+)
 from restaurante.modules.staff.infrastructure.models import EmployeeModel
 from restaurante.shared.database import SessionFactory
 from restaurante.shared.tenancy.models import BranchModel, TenantModel
 from tests.conftest import TEST_EMAIL, TEST_PASSWORD
+from tests.modules._cash import seed_open_cash_session
 
 
 # --- shared helpers ---------------------------------------------------------
@@ -101,6 +107,25 @@ async def _create_product_and_variant() -> tuple[uuid.UUID, uuid.UUID]:
             tenant_id=tenant_id, product_id=product.id, name="L", is_active=True
         )
         session.add(variant)
+        await session.flush()
+        # A sellable variant must have a recipe (order add-item safety net); give it one.
+        unit = UnitOfMeasureModel(name="unit", abbreviation="und")
+        session.add(unit)
+        await session.flush()
+        ingredient = IngredientModel(
+            tenant_id=tenant_id, name="Beef", unit_of_measure_id=unit.id, is_active=True
+        )
+        session.add(ingredient)
+        await session.flush()
+        session.add(
+            RecipeItemModel(
+                tenant_id=tenant_id,
+                product_variant_id=variant.id,
+                ingredient_id=ingredient.id,
+                quantity=Decimal("1"),
+                unit_of_measure_id=unit.id,
+            )
+        )
         await session.commit()
         await session.refresh(product)
         await session.refresh(variant)
@@ -222,7 +247,7 @@ async def test_multi_station_product_each_ticket_carries_its_role(
     order_id, _ = await _seed_order_with_item(branch_id, variant_id)
     routed = await client.post(f"/kitchen/orders/{order_id}/route", headers=headers)
     assert routed.status_code == 201
-    tickets = routed.json()
+    tickets = routed.json()["tickets"]
     assert len(tickets) == 2
     roles_by_station = {t["kitchen_station_id"]: t["role"] for t in tickets}
     assert roles_by_station[grill] == "Carne y armado"
@@ -255,7 +280,7 @@ async def test_ticket_role_is_frozen_when_mapping_edited(client: AsyncClient) ->
 
     # Re-route is idempotent and must NOT rewrite the frozen ticket role.
     again = await client.post(f"/kitchen/orders/{order_id}/route", headers=headers)
-    assert again.json() == []
+    assert again.json()["tickets"] == []
     board = await client.get(
         f"/kitchen/stations/{station}/tickets", headers=headers
     )
@@ -272,7 +297,7 @@ async def test_omitted_role_is_null(client: AsyncClient) -> None:
     assert mapping["role"] is None
     order_id, _ = await _seed_order_with_item(branch_id, variant_id)
     routed = await client.post(f"/kitchen/orders/{order_id}/route", headers=headers)
-    assert routed.json()[0]["role"] is None
+    assert routed.json()["tickets"][0]["role"] is None
 
 
 # ============================ Ready rollup (4.8) ============================
@@ -306,7 +331,7 @@ async def test_mixed_states_in_kitchen_all_ready_flags_order(
     order_id, _ = await _seed_order_with_item(branch_id, variant_id)
     tickets = (
         await client.post(f"/kitchen/orders/{order_id}/route", headers=headers)
-    ).json()
+    ).json()["tickets"]
     assert await _order_state(client, headers, order_id) == "in_kitchen"
 
     # Advance only the first ticket to ready -> still in_kitchen.
@@ -337,6 +362,7 @@ async def test_add_item_after_ready_returns_to_in_kitchen(
     product_id, variant_id = await _create_product_and_variant()
     await _attach(client, headers, product_id, station)
     employee_id = await _create_employee(branch_id)
+    await seed_open_cash_session(branch_id, employee_id)
     order_id = (
         await client.post(
             "/orders",
@@ -348,12 +374,13 @@ async def test_add_item_after_ready_returns_to_in_kitchen(
             },
         )
     ).json()["id"]
-    # Add a mapped item -> auto-route -> in_kitchen.
+    # Add a mapped item, then send to kitchen -> in_kitchen.
     await client.post(
         f"/orders/{order_id}/items",
         headers=headers,
         json={"product_variant_id": str(variant_id), "quantity": 1, "unit_price": "10000"},
     )
+    await client.post(f"/kitchen/orders/{order_id}/route", headers=headers)
     assert await _order_state(client, headers, order_id) == "in_kitchen"
 
     ticket_id = (
@@ -362,13 +389,54 @@ async def test_add_item_after_ready_returns_to_in_kitchen(
     await _route_and_advance(client, headers, ticket_id)
     assert await _order_state(client, headers, order_id) == "ready"
 
-    # Adding another mapped item reopens the kitchen state.
+    # Adding another mapped item and sending again reopens the kitchen state.
     await client.post(
         f"/orders/{order_id}/items",
         headers=headers,
         json={"product_variant_id": str(variant_id), "quantity": 1, "unit_price": "10000"},
     )
+    await client.post(f"/kitchen/orders/{order_id}/route", headers=headers)
     assert await _order_state(client, headers, order_id) == "in_kitchen"
+
+
+async def test_delivery_ready_keeps_the_address_captured_at_open(
+    client: AsyncClient,
+) -> None:
+    """An address captured when the order was taken must survive the ready transition.
+
+    The readiness hook calls `create_delivery(address_text="")` as a safety net for orders
+    that reached the kitchen with no address. It must never clobber one that is already
+    there — it relies on the duplicate-delivery conflict to no-op.
+    """
+    await _assign_admin()
+    headers = await _login(client)
+    branch_id = await _create_branch()
+    station = await _create_station(client, headers, branch_id, "Parrilla")
+    product_id, variant_id = await _create_product_and_variant()
+    await _attach(client, headers, product_id, station)
+    order_id, _ = await _seed_order_with_item(branch_id, variant_id, channel="delivery")
+
+    # The Salón/comanda path: the address is captured while the order is taken.
+    created = await client.post(
+        "/delivery/deliveries",
+        headers=headers,
+        json={"order_id": str(order_id), "address_text": "Calle 15 #10-20"},
+    )
+    assert created.status_code == 201
+
+    ticket_id = (
+        await client.post(f"/kitchen/orders/{order_id}/route", headers=headers)
+    ).json()["tickets"][0]["id"]
+    await _route_and_advance(client, headers, ticket_id)
+    assert await _order_state(client, headers, order_id) == "ready"
+
+    # The readiness hook fired; the address is intact and still the only record.
+    got = await client.get(f"/delivery/orders/{order_id}/delivery", headers=headers)
+    assert got.json()["address_text"] == "Calle 15 #10-20"
+    listing = await client.get(
+        "/delivery/deliveries", headers=headers, params={"branch_id": str(branch_id)}
+    )
+    assert len([d for d in listing.json() if d["order_id"] == str(order_id)]) == 1
 
 
 async def test_delivery_ready_auto_creates_delivery_once(client: AsyncClient) -> None:
@@ -381,7 +449,7 @@ async def test_delivery_ready_auto_creates_delivery_once(client: AsyncClient) ->
     order_id, _ = await _seed_order_with_item(branch_id, variant_id, channel="delivery")
     ticket_id = (
         await client.post(f"/kitchen/orders/{order_id}/route", headers=headers)
-    ).json()[0]["id"]
+    ).json()["tickets"][0]["id"]
 
     await _route_and_advance(client, headers, ticket_id)
     assert await _order_state(client, headers, order_id) == "ready"
@@ -393,7 +461,9 @@ async def test_delivery_ready_auto_creates_delivery_once(client: AsyncClient) ->
 
     # Idempotent: recomputing readiness again does not create a second record.
     await client.post(f"/kitchen/orders/{order_id}/route", headers=headers)
-    listing = await client.get("/delivery/deliveries", headers=headers)
+    listing = await client.get(
+        "/delivery/deliveries", headers=headers, params={"branch_id": str(branch_id)}
+    )
     matches = [d for d in listing.json() if d["order_id"] == str(order_id)]
     assert len(matches) == 1
 
