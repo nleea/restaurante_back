@@ -84,12 +84,35 @@ PERMISSIONS: tuple[PermissionDef, ...] = (
     _p("delivery.assign", "Assign delivery", "delivery",
        "Assign drivers and routes to deliveries."),
     _p("delivery.manage", "Manage delivery", "delivery",
-       "Manage routes, drivers and runs."),
-    # Messaging (WhatsApp)
+       "Manage routes, drivers, branch delivery settings and runs."),
+    _p("delivery.address", "Capture delivery address", "delivery",
+       "Write and correct a single order's delivery address, without granting "
+       "delivery administration."),
+    _p("delivery.drive", "Drive delivery", "delivery",
+       "Open and work your OWN delivery run (despacho): read your run, depart, "
+       "finish, and mark your own deliveries — no dispatcher permissions."),
+    # Messaging (WhatsApp). Read is split from act on purpose: an owner can watch the
+    # inbox without being able to answer in the restaurant's voice.
     _p("messaging.read", "View messaging", "messaging",
-       "View WhatsApp conversations."),
-    _p("messaging.send", "Send messages", "messaging",
-       "Send WhatsApp messages / take over chats."),
+       "Read the WhatsApp inbox: conversations and their threads."),
+    _p("messaging.attend", "Attend conversations", "messaging",
+       "Claim a WhatsApp conversation, reply to it and close it."),
+    _p("messaging.manage", "Manage WhatsApp sessions", "messaging",
+       "Pair a branch's WhatsApp number and see every branch's connection status."),
+    # Alerts (cross-cutting watchdog). Read is split from manage because seeing that the
+    # tomato is low —and taking that alert— is the shift's job, while deciding thresholds
+    # and who gets a WhatsApp at 11pm is the owner's.
+    _p("alerts.read", "View alerts", "alerts",
+       "See what is firing for a branch and acknowledge an alert."),
+    _p("alerts.manage", "Configure alerts", "alerts",
+       "Enable rules and set thresholds, recovery buffers and escalation delays."),
+    # Assistant (LLM). `use` es "puedo preguntarle"; `manage` es "puedo ver lo que cuesta y
+    # comprar más". Se parten porque son dos personas distintas: quien pregunta cuánto se
+    # vendió ayer no es necesariamente quien decide cuánto saldo se compra este mes.
+    _p("assistant.use", "Use the assistant", "assistant",
+       "Ask the assistant questions from the admin panel, within your own permissions."),
+    _p("assistant.manage", "Manage the assistant", "assistant",
+       "See usage against the quota and enable or disable the assistant for the business."),
     # Catalog (global reference data)
     _p("catalog.read", "View catalog", "catalog",
        "View countries, cities and units of measure."),
@@ -119,25 +142,36 @@ BASE_ROLES: dict[str, set[str]] = {
         "finance.read", "finance.manage",
         "staff.read", "staff.manage",
         "customers.read", "customers.manage",
-        "kitchen.read", "delivery.read", "delivery.assign", "delivery.manage",
-        "messaging.read", "messaging.send", "reports.view",
+        "kitchen.read",
+        "delivery.read", "delivery.assign", "delivery.manage", "delivery.address",
+        "messaging.read", "messaging.attend", "messaging.manage", "reports.view",
+        "alerts.read", "alerts.manage",
+        "assistant.use", "assistant.manage",
     },
+    # Whoever answers the phone captures the address, so the order-taking roles hold
+    # `delivery.address` — but not `delivery.manage`, which would also hand them the
+    # business pin, the delivery rings and the driver roster.
     "cashier": {
         "menu.read",
         "orders.read", "orders.create", "orders.update", "orders.pay",
         "cash.read", "cash.open", "cash.close", "cash.move",
         "customers.read", "customers.manage",
+        "delivery.address",
     },
     "waiter": {
         "menu.read",
         "orders.read", "orders.create", "orders.update",
         "customers.read",
+        "delivery.address",
     },
     "kitchen": {
         "orders.read", "kitchen.read", "kitchen.update",
     },
+    # The courier drives their own despacho end to end: open (self-create + pull),
+    # depart, deliver / not-deliver, finish — all on their own run via `delivery.drive`,
+    # never the dispatcher's `delivery.assign`/`delivery.manage`.
     "courier": {
-        "orders.read", "delivery.read", "messaging.read",
+        "orders.read", "delivery.read", "delivery.drive", "messaging.read",
     },
 }
 

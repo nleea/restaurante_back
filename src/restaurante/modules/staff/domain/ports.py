@@ -55,6 +55,32 @@ class StaffRepository(Protocol):
         active: bool | None = None,
     ) -> list[Employee]: ...
 
+    async def set_whatsapp_contact(
+        self,
+        tenant_id: uuid.UUID,
+        employee_id: uuid.UUID,
+        contact_id: uuid.UUID | None,
+    ) -> bool:
+        """Con qué chat de WhatsApp se corresponde esta persona."""
+        ...
+
+    async def set_alert_subscription(
+        self, tenant_id: uuid.UUID, employee_id: uuid.UUID, receives: bool
+    ) -> bool:
+        """Si a esta persona se le escribe cuando una alerta lleva rato sin tomar."""
+        ...
+
+    async def set_person_phone(
+        self, tenant_id: uuid.UUID, employee_id: uuid.UUID, phone: str | None
+    ) -> bool:
+        """El teléfono de la persona detrás del empleado; `False` si no existe.
+
+        Vive en `persons`, no en `employees`: es de la persona, no del puesto. Y es el único
+        dato de contacto que el sistema usa para escribirle al personal —hoy, las alertas
+        escaladas por WhatsApp—, así que sin él ese aviso no puede salir.
+        """
+        ...
+
     async def update_employee(
         self, tenant_id: uuid.UUID, employee_id: uuid.UUID, fields: dict[str, Any]
     ) -> Employee | None: ...

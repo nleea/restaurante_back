@@ -18,6 +18,10 @@ from restaurante.modules.cash.infrastructure.models import (
     CashMovementModel,
     CashSessionModel,
 )
+from restaurante.modules.delivery.domain.entities import (
+    DELIVERY_TERMINAL_STATUSES,
+)
+from restaurante.modules.delivery.infrastructure.models import OrderDeliveryModel
 from restaurante.modules.finance.infrastructure.models import (
     ExpenseCategoryModel,
     ExpenseModel,
@@ -38,6 +42,10 @@ from restaurante.modules.purchasing.infrastructure.models import (
     PurchasePaymentModel,
 )
 from restaurante.modules.recipes.infrastructure.models import RecipeItemModel
+from restaurante.modules.reports.domain.entities import (
+    ShiftDeliveryRow,
+    ShiftOrderRow,
+)
 from restaurante.modules.reports.domain.ports import (
     ChannelAgg,
     DailyAgg,
@@ -72,6 +80,92 @@ def _dec(value: Decimal | None) -> Decimal:
 class SqlAlchemyReportsRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
+
+    async def uncollected_orders_for_session(
+        self, tenant_id: uuid.UUID, cash_session_id: uuid.UUID
+    ) -> tuple[int, Decimal]:
+        # Orders of this session still open = not yet collected (a closed order is paid or
+        # on credit, per order-close-requires-payment). Uses orders.cash_session_id directly.
+        stmt = select(
+            func.count(OrderModel.id),
+            func.coalesce(func.sum(OrderModel.total), 0),
+        ).where(
+            OrderModel.tenant_id == tenant_id,
+            OrderModel.cash_session_id == cash_session_id,
+            OrderModel.status == "open",
+        )
+        count, total = (await self._session.execute(stmt)).one()
+        return int(count), Decimal(str(total))
+
+    async def undelivered_deliveries_for_session(
+        self, tenant_id: uuid.UUID, cash_session_id: uuid.UUID
+    ) -> int:
+        # Deliveries of this session's orders not yet in a terminal state.
+        stmt = (
+            select(func.count(OrderDeliveryModel.id))
+            .join(OrderModel, OrderDeliveryModel.order_id == OrderModel.id)
+            .where(
+                OrderDeliveryModel.tenant_id == tenant_id,
+                OrderModel.cash_session_id == cash_session_id,
+                OrderDeliveryModel.delivery_status.notin_(
+                    DELIVERY_TERMINAL_STATUSES
+                ),
+            )
+        )
+        return int((await self._session.execute(stmt)).scalar_one())
+
+    async def orders_for_session(
+        self, tenant_id: uuid.UUID, cash_session_id: uuid.UUID
+    ) -> list[ShiftOrderRow]:
+        stmt = (
+            select(
+                OrderModel.id,
+                OrderModel.channel,
+                OrderModel.status,
+                OrderModel.total,
+                OrderModel.created_at,
+            )
+            .where(
+                OrderModel.tenant_id == tenant_id,
+                OrderModel.cash_session_id == cash_session_id,
+            )
+            .order_by(OrderModel.created_at)
+        )
+        rows = (await self._session.execute(stmt)).all()
+        return [
+            ShiftOrderRow(
+                id=r[0], channel=r[1], status=r[2], total=_dec(r[3]), created_at=r[4]
+            )
+            for r in rows
+        ]
+
+    async def deliveries_for_session_detail(
+        self, tenant_id: uuid.UUID, cash_session_id: uuid.UUID
+    ) -> list[ShiftDeliveryRow]:
+        stmt = (
+            select(
+                OrderDeliveryModel.order_id,
+                OrderDeliveryModel.delivery_status,
+                OrderDeliveryModel.address_text,
+                OrderDeliveryModel.neighborhood,
+            )
+            .join(OrderModel, OrderDeliveryModel.order_id == OrderModel.id)
+            .where(
+                OrderDeliveryModel.tenant_id == tenant_id,
+                OrderModel.cash_session_id == cash_session_id,
+            )
+            .order_by(OrderDeliveryModel.created_at)
+        )
+        rows = (await self._session.execute(stmt)).all()
+        return [
+            ShiftDeliveryRow(
+                order_id=r[0],
+                delivery_status=r[1],
+                address_text=r[2],
+                neighborhood=r[3],
+            )
+            for r in rows
+        ]
 
     async def get_session_facts(
         self, tenant_id: uuid.UUID, cash_session_id: uuid.UUID

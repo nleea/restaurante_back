@@ -38,6 +38,8 @@ from restaurante.modules.staff.infrastructure.api.schemas import (
     RejectTimeOffRequest,
     ShiftTemplateResponse,
     TimeOffRequestResponse,
+    UpdateAlertSubscriptionRequest,
+    UpdateEmployeePhoneRequest,
     UpdateEmployeeRoleRequest,
     UpdatePlannedShiftRequest,
     UpsertTemplateRequest,
@@ -150,6 +152,49 @@ async def update_employee_role(
     return EmployeeResponse.model_validate(employee, from_attributes=True)
 
 
+@router.patch(
+    "/employees/{employee_id}/phone",
+    response_model=EmployeeResponse,
+    dependencies=[_WRITE],
+)
+async def update_employee_phone(
+    employee_id: uuid.UUID,
+    payload: UpdateEmployeePhoneRequest,
+    service: StaffServiceDep,
+    tenant_id: TenantDep,
+) -> EmployeeResponse:
+    """El teléfono al que el sistema puede escribirle a esta persona.
+
+    Hoy lo usa una sola cosa: el escalado de alertas por WhatsApp. Sin teléfono, esa persona
+    no recibe el aviso — y hasta ahora no había ninguna forma de ponérselo desde la
+    aplicación, así que el escalado no podía llegarle a nadie.
+    """
+    employee = await service.set_employee_phone(tenant_id, employee_id, payload.phone)
+    return EmployeeResponse.model_validate(employee, from_attributes=True)
+
+
+@router.patch(
+    "/employees/{employee_id}/alert-subscription",
+    response_model=EmployeeResponse,
+    dependencies=[_WRITE],
+)
+async def update_alert_subscription(
+    employee_id: uuid.UUID,
+    payload: UpdateAlertSubscriptionRequest,
+    service: StaffServiceDep,
+    tenant_id: TenantDep,
+) -> EmployeeResponse:
+    """A quién se le escribe cuando una alerta lleva rato sin que nadie la tome.
+
+    Es una elección y no un permiso: ver el panel de alertas y que le suene el móvil a las
+    once de la noche son cosas distintas. Nace apagado para todos.
+    """
+    employee = await service.set_alert_subscription(
+        tenant_id, employee_id, payload.receives_alerts
+    )
+    return EmployeeResponse.model_validate(employee, from_attributes=True)
+
+
 @router.delete(
     "/employees/{employee_id}", response_model=EmployeeResponse, dependencies=[_WRITE]
 )
@@ -157,6 +202,20 @@ async def deactivate_employee(
     employee_id: uuid.UUID, service: StaffServiceDep, tenant_id: TenantDep
 ) -> EmployeeResponse:
     employee = await service.deactivate_employee(tenant_id, employee_id)
+    return EmployeeResponse.model_validate(employee, from_attributes=True)
+
+
+# Reactivation is its own verb rather than a PATCH on `is_active`: deactivation is a DELETE,
+# so the inverse stays an explicit, auditable action instead of a generic field write.
+@router.post(
+    "/employees/{employee_id}/activate",
+    response_model=EmployeeResponse,
+    dependencies=[_WRITE],
+)
+async def activate_employee(
+    employee_id: uuid.UUID, service: StaffServiceDep, tenant_id: TenantDep
+) -> EmployeeResponse:
+    employee = await service.activate_employee(tenant_id, employee_id)
     return EmployeeResponse.model_validate(employee, from_attributes=True)
 
 

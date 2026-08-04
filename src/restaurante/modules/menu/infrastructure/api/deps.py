@@ -8,6 +8,9 @@ from typing import Annotated
 from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from restaurante.modules.menu.application.use_cases.manage_appearance import (
+    AppearanceService,
+)
 from restaurante.modules.menu.application.use_cases.manage_menu import MenuService
 from restaurante.modules.menu.infrastructure.repositories import (
     SqlAlchemyMenuRepository,
@@ -24,3 +27,10 @@ def get_menu_service(session: SessionDep) -> MenuService:
 
 
 MenuServiceDep = Annotated[MenuService, Depends(get_menu_service)]
+
+
+def get_appearance_service(session: SessionDep) -> AppearanceService:
+    return AppearanceService(repo=SqlAlchemyMenuRepository(session))
+
+
+AppearanceServiceDep = Annotated[AppearanceService, Depends(get_appearance_service)]

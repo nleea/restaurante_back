@@ -27,6 +27,7 @@ from restaurante.shared.domain.errors import (
     NotFoundError,
     ValidationError,
 )
+from restaurante.shared.domain.phones import normalize_phone
 
 _HORIZON_DAYS = 90
 
@@ -134,12 +135,81 @@ class StaffService:
             raise NotFoundError(f"Empleado no encontrado: {employee_id}")
         return updated
 
+    async def set_employee_phone(
+        self, tenant_id: uuid.UUID, employee_id: uuid.UUID, phone: str | None
+    ) -> Employee:
+        """Guarda el teléfono ya normalizado, o lo borra con vacío.
+
+        Se normaliza AL GUARDAR y no al comparar porque el dato queda así en la base: quien
+        lo lea después —hoy el escalado de alertas, mañana lo que sea— no tiene que acordarse
+        de hacerlo. Un `+57 300 111 2233` tecleado por una persona y el `573001112233` que
+        manda WhatsApp son el mismo número, y aquí es donde dejan de parecer distintos.
+        """
+        await self._require_employee(tenant_id, employee_id)
+        cleaned = normalize_phone(phone) if phone else ""
+        if not await self._repo.set_person_phone(
+            tenant_id, employee_id, cleaned or None
+        ):
+            raise NotFoundError(f"Empleado no encontrado: {employee_id}")
+        employee = await self._repo.get_employee(tenant_id, employee_id)
+        if employee is None:
+            raise NotFoundError(f"Empleado no encontrado: {employee_id}")
+        return employee
+
+    async def set_whatsapp_contact(
+        self,
+        tenant_id: uuid.UUID,
+        employee_id: uuid.UUID,
+        contact_id: uuid.UUID | None,
+    ) -> Employee:
+        """Empareja a esta persona con su chat de WhatsApp. `None` la desempareja.
+
+        Se elige a mano y no se deduce del teléfono porque deducirlo es imposible: en modo
+        privacidad WhatsApp manda un `@lid` en vez del número, y de esos contactos nunca
+        sabemos el teléfono. Lo único cierto es "esta persona ya escribió", y eso se sabe
+        mirando los chats que existen.
+        """
+        await self._require_employee(tenant_id, employee_id)
+        if not await self._repo.set_whatsapp_contact(tenant_id, employee_id, contact_id):
+            raise NotFoundError(f"Empleado no encontrado: {employee_id}")
+        employee = await self._repo.get_employee(tenant_id, employee_id)
+        if employee is None:
+            raise NotFoundError(f"Empleado no encontrado: {employee_id}")
+        return employee
+
+    async def set_alert_subscription(
+        self, tenant_id: uuid.UUID, employee_id: uuid.UUID, receives: bool
+    ) -> Employee:
+        """Elige si a esta persona se le escribe por WhatsApp cuando algo lleva rato ardiendo.
+
+        No se exige tener teléfono para encenderlo: el orden natural en la pantalla es
+        marcar a quién quieres avisar y luego rellenar lo que falte. Quien no tenga teléfono
+        simplemente no recibe nada, y el diagnóstico de la pantalla de alertas lo dice.
+        """
+        await self._require_employee(tenant_id, employee_id)
+        if not await self._repo.set_alert_subscription(tenant_id, employee_id, receives):
+            raise NotFoundError(f"Empleado no encontrado: {employee_id}")
+        employee = await self._repo.get_employee(tenant_id, employee_id)
+        if employee is None:
+            raise NotFoundError(f"Empleado no encontrado: {employee_id}")
+        return employee
+
     async def deactivate_employee(
         self, tenant_id: uuid.UUID, employee_id: uuid.UUID
     ) -> Employee:
+        return await self._set_employee_active(tenant_id, employee_id, active=False)
+
+    async def activate_employee(
+        self, tenant_id: uuid.UUID, employee_id: uuid.UUID
+    ) -> Employee:
+        return await self._set_employee_active(tenant_id, employee_id, active=True)
+
+    async def _set_employee_active(
+        self, tenant_id: uuid.UUID, employee_id: uuid.UUID, *, active: bool
+    ) -> Employee:
         await self._require_employee(tenant_id, employee_id)
         updated = await self._repo.update_employee(
-            tenant_id, employee_id, {"is_active": False}
+            tenant_id, employee_id, {"is_active": active}
         )
         if updated is None:
             raise NotFoundError(f"Empleado no encontrado: {employee_id}")

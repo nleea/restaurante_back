@@ -13,6 +13,54 @@ from decimal import Decimal
 
 
 @dataclass
+class ShiftPendingSummary:
+    """What is still unresolved in a session before it is closed (advisory only).
+
+    Uncollected = orders of the session still ``open`` (a closed order is paid or on
+    credit, per order-close-requires-payment). Undelivered = the session's deliveries
+    not yet in a terminal state — the list lives in
+    ``delivery.domain.entities.DELIVERY_TERMINAL_STATUSES`` and is deliberately NOT
+    repeated here: a copy that falls behind blocks a till with no visible cause.
+    """
+
+    uncollected_count: int
+    uncollected_total: Decimal
+    undelivered_count: int
+
+
+@dataclass
+class ShiftOrderRow:
+    """One order in a closed shift's operational record."""
+
+    id: uuid.UUID
+    channel: str
+    status: str
+    total: Decimal
+    created_at: datetime | None
+
+
+@dataclass
+class ShiftDeliveryRow:
+    """One delivery in a closed shift's operational record."""
+
+    order_id: uuid.UUID
+    delivery_status: str
+    address_text: str
+    neighborhood: str | None
+
+
+@dataclass
+class ShiftRecord:
+    """The operational record of a (closed) shift — the companion to the Reporte Z.
+
+    Read-only history keyed by ``cash_session_id``; legacy null-session rows never appear.
+    """
+
+    orders: list[ShiftOrderRow] = field(default_factory=list)
+    deliveries: list[ShiftDeliveryRow] = field(default_factory=list)
+
+
+@dataclass
 class ZChannelLine:
     channel: str
     amount: Decimal

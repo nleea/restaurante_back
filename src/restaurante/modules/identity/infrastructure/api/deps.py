@@ -34,7 +34,11 @@ from restaurante.shared.audit.recorder import SqlAlchemyAuditRecorder
 from restaurante.shared.cache import get_cache
 from restaurante.shared.config import get_settings
 from restaurante.shared.database import get_session
-from restaurante.shared.domain.errors import AuthenticationError, InvalidTokenError
+from restaurante.shared.domain.errors import (
+    AuthenticationError,
+    AuthorizationError,
+    InvalidTokenError,
+)
 from restaurante.shared.security.jwt import ACCESS, JwtTokenService
 from restaurante.shared.security.password import Argon2PasswordHasher
 
@@ -176,6 +180,32 @@ def require_permission(code: str) -> Callable[..., Awaitable[User]]:
         authz: AuthorizationDep,
     ) -> User:
         await authz.ensure(tenant_id, current_user.id, code)
+        return current_user
+
+    return _checker
+
+
+def require_any_permission(*codes: str) -> Callable[..., Awaitable[User]]:
+    """Build a dependency that enforces holding *at least one* of the given codes.
+
+    For endpoints reachable by two legitimately different roles — e.g. a delivery record
+    is writable both by whoever takes the order (`delivery.address`) and by whoever runs
+    dispatch (`delivery.manage`). Splitting a permission would otherwise 403 the roles
+    provisioned before the split.
+    """
+    if not codes:
+        raise ValueError("require_any_permission needs at least one code.")
+
+    async def _checker(
+        current_user: CurrentUserDep,
+        tenant_id: TenantDep,
+        authz: AuthorizationDep,
+    ) -> User:
+        effective = await authz.effective_codes(tenant_id, current_user.id)
+        if not any(code in effective for code in codes):
+            raise AuthorizationError(
+                f"Falta alguno de los permisos requeridos: {', '.join(codes)}"
+            )
         return current_user
 
     return _checker

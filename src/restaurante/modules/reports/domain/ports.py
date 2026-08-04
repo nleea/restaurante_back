@@ -9,6 +9,8 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Protocol
 
+from restaurante.modules.reports.domain.entities import ShiftDeliveryRow, ShiftOrderRow
+
 
 @dataclass
 class SessionFacts:
@@ -94,6 +96,22 @@ class ReportsRepository(Protocol):
     async def get_session_facts(
         self, tenant_id: uuid.UUID, cash_session_id: uuid.UUID
     ) -> SessionFacts | None: ...
+
+    async def uncollected_orders_for_session(
+        self, tenant_id: uuid.UUID, cash_session_id: uuid.UUID
+    ) -> tuple[int, Decimal]: ...
+
+    async def undelivered_deliveries_for_session(
+        self, tenant_id: uuid.UUID, cash_session_id: uuid.UUID
+    ) -> int: ...
+
+    async def orders_for_session(
+        self, tenant_id: uuid.UUID, cash_session_id: uuid.UUID
+    ) -> list[ShiftOrderRow]: ...
+
+    async def deliveries_for_session_detail(
+        self, tenant_id: uuid.UUID, cash_session_id: uuid.UUID
+    ) -> list[ShiftDeliveryRow]: ...
 
     async def order_ids_for_session(
         self, tenant_id: uuid.UUID, cash_session_id: uuid.UUID

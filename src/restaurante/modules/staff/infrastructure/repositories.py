@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
-from typing import Any
+from typing import Any, cast
 
+from sqlalchemy import CursorResult, or_, select
 from sqlalchemy import delete as sql_delete
-from sqlalchemy import or_, select
+from sqlalchemy import update as sql_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -42,7 +43,7 @@ from restaurante.shared.domain.errors import ConflictError
 from restaurante.shared.tenancy.models import BranchModel
 
 
-def _employee(m: EmployeeModel) -> Employee:
+def _employee(m: EmployeeModel, phone: str | None = None) -> Employee:
     return Employee(
         id=m.id,
         tenant_id=m.tenant_id,
@@ -52,6 +53,9 @@ def _employee(m: EmployeeModel) -> Employee:
         role_id=m.role_id,
         hired_at=m.hired_at,
         is_active=m.is_active,
+        phone=phone,
+        receives_alerts=m.receives_alerts,
+        whatsapp_contact_id=m.whatsapp_contact_id,
     )
 
 
@@ -185,7 +189,14 @@ class SqlAlchemyStaffRepository:
         self, tenant_id: uuid.UUID, employee_id: uuid.UUID
     ) -> Employee | None:
         model = await self._get_employee_model(tenant_id, employee_id)
-        return _employee(model) if model else None
+        if model is None:
+            return None
+        phone = (
+            await self._session.execute(
+                select(PersonModel.phone).where(PersonModel.id == model.person_id)
+            )
+        ).scalar_one_or_none()
+        return _employee(model, phone)
 
     async def find_employee_by_user(
         self, tenant_id: uuid.UUID, user_id: uuid.UUID
@@ -227,8 +238,76 @@ class SqlAlchemyStaffRepository:
             stmt = stmt.where(EmployeeModel.branch_id == branch_id)
         if active is not None:
             stmt = stmt.where(EmployeeModel.is_active.is_(active))
+        # El teléfono viaja con el empleado (`persons`, unido de paso) porque la ficha lo
+        # muestra y lo edita, y una segunda consulta por empleado para un campo sería peor.
+        stmt = stmt.add_columns(PersonModel.phone).join(
+            PersonModel, PersonModel.id == EmployeeModel.person_id
+        )
         stmt = stmt.order_by(EmployeeModel.hired_at)
-        return [_employee(m) for m in (await self._session.execute(stmt)).scalars()]
+        rows = (await self._session.execute(stmt)).all()
+        return [_employee(model, phone) for model, phone in rows]
+
+    async def set_whatsapp_contact(
+        self,
+        tenant_id: uuid.UUID,
+        employee_id: uuid.UUID,
+        contact_id: uuid.UUID | None,
+    ) -> bool:
+        """Empareja al empleado con su chat de WhatsApp; `None` lo desempareja."""
+        result = cast(
+            "CursorResult[Any]",
+            await self._session.execute(
+                sql_update(EmployeeModel)
+                .where(
+                    EmployeeModel.id == employee_id,
+                    EmployeeModel.tenant_id == tenant_id,
+                )
+                .values(whatsapp_contact_id=contact_id)
+            ),
+        )
+        await self._session.commit()
+        return bool(result.rowcount)
+
+    async def set_alert_subscription(
+        self, tenant_id: uuid.UUID, employee_id: uuid.UUID, receives: bool
+    ) -> bool:
+        """Enciende o apaga el aviso por WhatsApp para esta persona; `False` si no existe."""
+        result = cast(
+            "CursorResult[Any]",
+            await self._session.execute(
+                sql_update(EmployeeModel)
+                .where(
+                    EmployeeModel.id == employee_id,
+                    EmployeeModel.tenant_id == tenant_id,
+                )
+                .values(receives_alerts=receives)
+            ),
+        )
+        await self._session.commit()
+        return bool(result.rowcount)
+
+    async def set_person_phone(
+        self, tenant_id: uuid.UUID, employee_id: uuid.UUID, phone: str | None
+    ) -> bool:
+        """Escribe en `persons`, alcanzando la fila a través del empleado del tenant.
+
+        El `join` con `employees` no es cosmético: `persons` es global (una persona puede
+        trabajar en dos negocios), así que sin acotar por el empleado del tenant esto
+        permitiría escribir en la ficha de alguien de otro negocio.
+        """
+        stmt = select(EmployeeModel.person_id).where(
+            EmployeeModel.id == employee_id, EmployeeModel.tenant_id == tenant_id
+        )
+        person_id = (await self._session.execute(stmt)).scalar_one_or_none()
+        if person_id is None:
+            return False
+        await self._session.execute(
+            sql_update(PersonModel)
+            .where(PersonModel.id == person_id)
+            .values(phone=phone)
+        )
+        await self._session.commit()
+        return True
 
     async def update_employee(
         self, tenant_id: uuid.UUID, employee_id: uuid.UUID, fields: dict[str, Any]
