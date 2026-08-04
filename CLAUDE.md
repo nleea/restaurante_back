@@ -57,7 +57,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Backend: **FastAPI + SQLAlchemy 2.0 async (asyncpg) + PostgreSQL + Alembic**, Poetry.
 Architecture: **hexagonal** (ports & adapters), modular by domain under `src/restaurante/`.
 Tenancy: **row-level `tenant_id`**, tenant resolved by **subdomain** (`<slug>.<BASE_DOMAIN>`).
+`BASE_DOMAIN` takes no wildcard — it is concatenated (`host.endswith("." + base)`), so
+`*.wsquote.uk` matches nothing and 400s every non-exempt request.
 Auth: JWT **access + refresh**, Argon2 password hashing.
+
+**Every route is mounted under `/api`** (`shared/api/prefix.py`, one aggregator router in
+`main.py` — including `/api/health` and `/api/docs`). The tenant comes from the Host, so a
+tenant's SPA and its API share a hostname, and fourteen SPA routes (`/menu`, `/orders`,
+`/inventory`, …) collide with fourteen API prefixes; the prefix is what makes one hostname
+serve both. Tests carry it in the client's `base_url`, so they still say `/auth/login`.
 
 ```bash
 poetry install
@@ -66,6 +74,11 @@ poetry run alembic upgrade head         # apply migrations
 poetry run python -m scripts.seed       # demo tenant + admin@demo.com / admin1234
 poetry run python -m scripts.seed_demo  # rich demo dataset for live testing (insumos, rutas, orders...) — idempotent
 poetry run uvicorn restaurante.main:app --reload
+# Delivery pins. RUN EXACTLY ONE — the geocoding providers allow ~1 req/s and answer a breach
+# with a SILENT BAN, so a second worker stops pins for everyone without raising anything.
+# Without it, deliveries stay "sin ubicación" forever. Needs CACHE_BACKEND=redis. See README.
+poetry run arq restaurante.modules.delivery.infrastructure.worker.WorkerSettings
+poetry run python -m scripts.geocode_pending  # manual drain + rollback path for the above
 poetry run pytest                       # tests (sqlite, no Postgres needed)
 poetry run pytest path::test_name       # single test
 poetry run ruff check .                 # lint

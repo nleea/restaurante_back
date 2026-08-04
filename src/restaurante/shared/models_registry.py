@@ -10,11 +10,21 @@ It only triggers import side effects, so the symbols are intentionally unused.
 
 from __future__ import annotations
 
+from restaurante.modules.alerts.infrastructure import models as _alerts  # noqa: F401
+from restaurante.modules.assistant.infrastructure import (  # noqa: F401
+    models as _assistant,
+)
+from restaurante.modules.business.infrastructure import (  # noqa: F401
+    models as _business,
+)
 from restaurante.modules.cash.infrastructure import models as _cash  # noqa: F401
 from restaurante.modules.catalog.infrastructure import models as _catalog  # noqa: F401
 from restaurante.modules.customers.infrastructure import models as _customers  # noqa: F401
 from restaurante.modules.delivery.infrastructure import models as _delivery  # noqa: F401
 from restaurante.modules.finance.infrastructure import models as _finance  # noqa: F401
+from restaurante.modules.guest_profile.infrastructure import (  # noqa: F401
+    models as _guest_profile,
+)
 from restaurante.modules.identity.infrastructure import models as _identity  # noqa: F401
 from restaurante.modules.inventory.infrastructure import models as _inventory  # noqa: F401
 from restaurante.modules.kitchen.infrastructure import models as _kitchen  # noqa: F401
