@@ -177,15 +177,25 @@ class SqlAlchemyCashRepository:
     async def list_movements(
         self, tenant_id: uuid.UUID, session_id: uuid.UUID
     ) -> list[CashMovement]:
+        # LEFT JOIN al pedido referenciado para traer su cuenta de mesa. Se hace aquí y no en
+        # el navegador porque la relación la conoce la base: reconstruirla en el front pediría
+        # una llamada por movimiento.
         stmt = (
-            select(CashMovementModel)
+            select(CashMovementModel, OrderModel.table_bill_id)
+            .outerjoin(OrderModel, OrderModel.id == CashMovementModel.reference_id)
             .where(
                 CashMovementModel.tenant_id == tenant_id,
                 CashMovementModel.cash_session_id == session_id,
             )
             .order_by(CashMovementModel.created_at)
         )
-        return [_movement(m) for m in (await self._session.execute(stmt)).scalars()]
+        rows = (await self._session.execute(stmt)).all()
+        movements = []
+        for model, bill_id in rows:
+            movement = _movement(model)
+            movement.table_bill_id = bill_id
+            movements.append(movement)
+        return movements
 
     async def unresolved_deliveries(
         self, tenant_id: uuid.UUID, cash_session_id: uuid.UUID

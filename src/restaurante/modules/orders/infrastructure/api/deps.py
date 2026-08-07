@@ -29,6 +29,7 @@ from restaurante.modules.orders.infrastructure.repositories import (
     SqlAlchemyOrdersRepository,
 )
 from restaurante.shared.api.deps import get_tenant_id
+from restaurante.shared.config import get_settings
 from restaurante.shared.database import get_session
 from restaurante.shared.domain.errors import ConflictError
 from restaurante.shared.realtime.deps import EventStreamDep, get_event_publisher
@@ -154,6 +155,9 @@ def get_order_service(session: SessionDep) -> OrderService:
         # soltar la entrega. Sin el puerto aquí, `_release_delivery` sale por la primera línea
         # y la entrega se queda bloqueando la caja — que es exactamente el bug de origen.
         delivery_dispatch=_delivery_dispatch(session),
+        # El dominio público de la carta, para poder construir el QR de una mesa. Se lee aquí
+        # y no dentro del caso de uso, igual que hace messaging con el mismo ajuste.
+        storefront_base_url=get_settings().storefront_base_url,
     )
 
 

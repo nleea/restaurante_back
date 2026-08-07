@@ -23,6 +23,7 @@ from restaurante.modules.orders.domain.entities import Order
 from restaurante.modules.storefront.application.use_cases.manage_storefront import (
     OrderLineCommand,
     StorefrontOrderCommand,
+    TableOrderCommand,
 )
 from restaurante.modules.storefront.infrastructure.api.deps import (
     AppearanceServiceDep,
@@ -32,6 +33,7 @@ from restaurante.modules.storefront.infrastructure.api.deps import (
 )
 from restaurante.modules.storefront.infrastructure.api.schemas import (
     CreateStorefrontOrderRequest,
+    CreateTableOrderRequest,
     StorefrontBranchResponse,
     StorefrontHoursResponse,
     StorefrontHourWindow,
@@ -39,6 +41,7 @@ from restaurante.modules.storefront.infrastructure.api.schemas import (
     StorefrontNextOpening,
     StorefrontOrderResponse,
     StorefrontSessionResponse,
+    StorefrontTableResponse,
 )
 from restaurante.shared.domain.errors import NotFoundError
 from restaurante.shared.domain.order_label import order_label
@@ -166,6 +169,84 @@ async def get_branch_menu(
     branch_id = await service.resolve_branch(tenant_id, branch_code)
     menu = await service.get_menu(tenant_id, branch_id)
     return StorefrontMenuResponse.from_menu(menu)
+
+
+@router.get(
+    "/{branch_code}/tables/{table_code}", response_model=StorefrontTableResponse
+)
+async def resolve_table(
+    branch_code: str,
+    table_code: str,
+    service: StorefrontServiceDep,
+    tenant_id: TenantDep,
+) -> StorefrontTableResponse:
+    """La mesa detrás del QR pegado a ella. Lectura pura: escanear no ocupa la mesa.
+
+    Sede y mesa vienen las dos de la RUTA, nunca del cuerpo — la misma regla que ya defiende la
+    carta. Una mesa que viajara en el cuerpo dejaría pedir a la mesa 5 mirando la carta de otra
+    sede, y la comida saldría en la cocina equivocada.
+
+    Un código desconocido, una mesa desactivada o una mesa de otra sede son 404 con código
+    propio (`table_not_found`), para que el front pinte el callejón sin salida —"este código no
+    corresponde a ninguna mesa"— en vez de una carta vacía. Nunca se cae a otra mesa.
+    """
+    branch_id = await service.resolve_branch(tenant_id, branch_code)
+    assert branch_id is not None  # `resolve_branch` con código levanta 404 si no existe
+    table = await service.resolve_table(tenant_id, branch_id, table_code)
+    return StorefrontTableResponse(
+        id=table.id,
+        number=table.number,
+        branch_id=table.branch_id,
+        branch_name=table.branch_name,
+        can_order_now=await service.can_take_orders(tenant_id, branch_id),
+    )
+
+
+@router.post(
+    "/{branch_code}/tables/{table_code}/orders",
+    response_model=StorefrontOrderResponse,
+    status_code=201,
+)
+async def create_table_order(
+    branch_code: str,
+    table_code: str,
+    payload: CreateTableOrderRequest,
+    service: StorefrontServiceDep,
+    tenant_id: TenantDep,
+) -> StorefrontOrderResponse:
+    """El pedido que confirma el comensal desde su mesa. Entra a cocina en el acto.
+
+    Es la excepción deliberada a `POST /storefront/orders`, que deja el pedido pendiente de que
+    el personal lo confirme: un pedido web lo hace un desconocido a distancia, y éste lo hace
+    alguien sentado en el local delante del plato que va a pagar. La revisión que allí hace el
+    personal, aquí la hizo el propio cliente antes de pulsar «Confirmar».
+
+    La mesa se resuelve otra vez aquí, aunque el front ya la resolviera para pintar la carta: lo
+    que el cliente vio no es una autorización, y entre una petición y otra la mesa puede haberse
+    desactivado.
+    """
+    branch_id = await service.resolve_branch(tenant_id, branch_code)
+    assert branch_id is not None  # con código, `resolve_branch` levanta 404 si no existe
+    table = await service.resolve_table(tenant_id, branch_id, table_code)
+    order = await service.create_table_order(
+        tenant_id,
+        branch_id,
+        table.id,
+        TableOrderCommand(
+            diner_name=payload.diner_name,
+            lines=[
+                OrderLineCommand(
+                    variant_id=line.variant_id,
+                    quantity=line.quantity,
+                    addon_ids=list(line.addon_ids),
+                    removed_ingredients=list(line.removed_ingredients),
+                    note=line.note,
+                )
+                for line in payload.lines
+            ],
+        ),
+    )
+    return _to_response(order)
 
 
 def _to_command(payload: CreateStorefrontOrderRequest) -> StorefrontOrderCommand:

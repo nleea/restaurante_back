@@ -19,6 +19,7 @@ from sqlalchemy import exists, select
 from sqlalchemy import update as sql_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from restaurante.modules.cash.infrastructure.models import CashSessionModel
 from restaurante.modules.identity.infrastructure.models import (
     PersonModel,
     RoleModel,
@@ -32,7 +33,10 @@ from restaurante.modules.menu.infrastructure.models import (
     ProductPriceModel,
     ProductVariantModel,
 )
-from restaurante.modules.orders.infrastructure.models import OrderModel
+from restaurante.modules.orders.infrastructure.models import (
+    DiningTableModel,
+    OrderModel,
+)
 from restaurante.modules.recipes.infrastructure.models import (
     IngredientModel,
     RecipeItemModel,
@@ -44,9 +48,14 @@ from restaurante.modules.storefront.domain.entities import (
     StoreCategory,
     StoreMenu,
     StoreProduct,
+    StoreTable,
     StoreVariant,
 )
 from restaurante.shared.tenancy.models import BranchModel
+
+# El estado de una sesión de caja abierta. Se repite aquí en vez de importarlo de `cash` para
+# no atar la carta pública al módulo de caja: lo único que se necesita es leer una fila.
+_CASH_OPEN = "open"
 
 # Sentinel login for the per-tenant web-orders employee. `users` is unique on
 # (tenant_id, email), so the same address is safely reused across tenants.
@@ -91,6 +100,49 @@ class SqlAlchemyStorefrontRepository:
             BranchModel.is_active.is_(True),
         )
         return (await self._session.execute(stmt)).scalar_one_or_none()
+
+    async def get_active_table_by_code(
+        self, tenant_id: uuid.UUID, branch_id: uuid.UUID, code: str
+    ) -> StoreTable | None:
+        # `branch_id` va en el WHERE y no se comprueba después: el código sólo es único dentro
+        # de su sede, así que buscarlo sin la sede podría encontrar la mesa 5 de otra sucursal.
+        stmt = (
+            select(
+                DiningTableModel.id,
+                DiningTableModel.number,
+                DiningTableModel.branch_id,
+                BranchModel.name.label("branch_name"),
+            )
+            .join(BranchModel, BranchModel.id == DiningTableModel.branch_id)
+            .where(
+                DiningTableModel.tenant_id == tenant_id,
+                DiningTableModel.branch_id == branch_id,
+                DiningTableModel.code == code,
+                DiningTableModel.is_active.is_(True),
+                BranchModel.is_active.is_(True),
+            )
+        )
+        row = (await self._session.execute(stmt)).first()
+        if row is None:
+            return None
+        return StoreTable(
+            id=row.id,
+            number=row.number,
+            branch_id=row.branch_id,
+            branch_name=row.branch_name,
+        )
+
+    async def has_open_cash_session(
+        self, tenant_id: uuid.UUID, branch_id: uuid.UUID
+    ) -> bool:
+        stmt = select(
+            exists().where(
+                CashSessionModel.tenant_id == tenant_id,
+                CashSessionModel.branch_id == branch_id,
+                CashSessionModel.status == _CASH_OPEN,
+            )
+        )
+        return bool((await self._session.execute(stmt)).scalar())
 
     async def list_active_branches(self, tenant_id: uuid.UUID) -> list[StoreBranch]:
         stmt = (

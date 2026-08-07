@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Protocol
@@ -18,6 +19,7 @@ from restaurante.modules.orders.domain.entities import (
     OrderPaymentClaim,
     OrderRefund,
     ReceiptPrint,
+    TableBill,
 )
 
 
@@ -139,6 +141,85 @@ class OrdersRepository(Protocol):
     async def update_dining_table(
         self, tenant_id: uuid.UUID, table_id: uuid.UUID, fields: dict[str, Any]
     ) -> DiningTable | None: ...
+
+    async def tenant_slug(self, tenant_id: uuid.UUID) -> str | None:
+        """El subdominio del negocio. Es la mitad de la dirección que va impresa en el QR."""
+        ...
+
+    async def branch_code(
+        self, tenant_id: uuid.UUID, branch_id: uuid.UUID
+    ) -> str | None:
+        """El código con el que la sede se direcciona en la URL pública."""
+        ...
+
+    async def count_open_orders_on_table(
+        self,
+        tenant_id: uuid.UUID,
+        table_id: uuid.UUID,
+        exclude_order_id: uuid.UUID | None = None,
+    ) -> int:
+        """Cuántas comandas siguen ABIERTAS en esa mesa, sin contar `exclude_order_id`.
+
+        Existe para poder liberar la mesa sólo cuando no queda nadie comiendo. Se excluye la
+        comanda en curso porque quien pregunta está a mitad de cerrarla o cancelarla y su propia
+        fila puede seguir viéndose abierta dentro de la misma transacción.
+        """
+        ...
+
+    # --- Table bills -------------------------------------------------------
+    def unit_of_work(self) -> AbstractAsyncContextManager[None]:
+        """Agrupa varias escrituras en UNA transacción: o quedan todas, o no queda ninguna.
+
+        Existe para el cobro de una cuenta de mesa, que son N pagos, N movimientos de caja, N
+        descuentos de inventario y N cierres. Dejar la mitad hechos —una comanda cerrada y otra
+        cobrada sin cerrar— es el peor resultado posible de esa operación.
+        """
+        ...
+
+    async def create_table_bill(self, bill: TableBill) -> TableBill: ...
+
+    async def get_table_bill(
+        self, tenant_id: uuid.UUID, bill_id: uuid.UUID
+    ) -> TableBill | None: ...
+
+    async def claim_orders_for_bill(
+        self, tenant_id: uuid.UUID, bill_id: uuid.UUID, order_ids: list[uuid.UUID]
+    ) -> int:
+        """Reclama esas comandas para la cuenta y devuelve cuántas se llevó de verdad.
+
+        Sólo se lleva las que están ABIERTAS y SIN cuenta. Comparar el recuento con lo pedido
+        es lo que convierte la carrera entre dos cajeros en un error legible, en vez de en una
+        cuenta a la que le falta gente sin decirlo.
+        """
+        ...
+
+    async def list_bill_members(
+        self, tenant_id: uuid.UUID, bill_id: uuid.UUID
+    ) -> list[Order]:
+        """Los miembros en el orden en que se reparte: `created_at`, y `id` para desempatar."""
+        ...
+
+    async def release_bill_orders(
+        self, tenant_id: uuid.UUID, bill_id: uuid.UUID
+    ) -> None: ...
+
+    async def delete_table_bill(
+        self, tenant_id: uuid.UUID, bill_id: uuid.UUID
+    ) -> None: ...
+
+    async def settle_table_bill(
+        self, tenant_id: uuid.UUID, bill_id: uuid.UUID, total: Decimal
+    ) -> None: ...
+
+    async def bill_receipt_data(
+        self, tenant_id: uuid.UUID, bill_id: uuid.UUID
+    ) -> dict[str, Any] | None:
+        """Todo lo que la tirilla necesita, ya junto. Ver la implementación."""
+        ...
+
+    async def bill_has_receipt(
+        self, tenant_id: uuid.UUID, bill_id: uuid.UUID
+    ) -> bool: ...
 
     # --- Orders ------------------------------------------------------------
     async def create_order(self, order: Order) -> Order: ...

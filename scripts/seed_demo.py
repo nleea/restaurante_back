@@ -1312,14 +1312,24 @@ async def seed_dining_tables(
 ) -> list[DiningTableModel]:
     tables: list[DiningTableModel] = []
     capacities = [2, 4, 4, 4, 6, 6, 8, 2]
-    for number, capacity in zip([str(n) for n in range(1, 9)], capacities, strict=True):
+    # Códigos fijos y legibles (`MESA01`…) en vez de acuñados al azar: es una semilla de demo, y
+    # poder teclear la URL del QR de la mesa 5 sin ir a mirar la base es justo lo que hace que
+    # esta pantalla se pueda probar. En producción los acuña el repositorio.
+    for index, (number, capacity) in enumerate(
+        zip([str(n) for n in range(1, 9)], capacities, strict=True), start=1
+    ):
         table, _ = await get_or_create(
             session,
             DiningTableModel,
             tenant_id=tenant_id,
             branch_id=branch_id,
             number=number,
-            defaults={"capacity": capacity, "status": "free", "is_active": True},
+            defaults={
+                "code": f"MESA{index:02d}",
+                "capacity": capacity,
+                "status": "free",
+                "is_active": True,
+            },
         )
         tables.append(table)
     return tables
@@ -1610,6 +1620,28 @@ LIVE_PLAN: list[dict[str, Any]] = [
         "tickets": {"Salchipapa Familiar": TICKET_PENDING, "Gaseosa Lata": TICKET_PENDING},
         "minutes_ago": 5,
     },
+    # Dos comensales que pidieron ELLOS MISMOS escaneando el QR de la mesa 7, cada uno con su
+    # comanda. Es el escenario que el pedido por QR introduce y que antes no existía en ninguna
+    # semilla: una mesa sosteniendo más de una comanda viva. Sin él no se puede mirar ni el
+    # sello del pase ni la mesa que NO se libera cuando el primero paga.
+    {
+        "channel": CHANNEL_DINE_IN,
+        "table": 6,
+        "diner_name": "Ana",
+        "origin": "qr",
+        "items": [("Hamburguesa Clásica", 1), ("Limonada Natural", 1)],
+        "tickets": {"Hamburguesa Clásica": TICKET_IN_PROGRESS, "Limonada Natural": TICKET_READY},
+        "minutes_ago": 9,
+    },
+    {
+        "channel": CHANNEL_DINE_IN,
+        "table": 6,
+        "diner_name": "Luis",
+        "origin": "qr",
+        "items": [("Perro Clásico", 2)],
+        "tickets": {"Perro Clásico": TICKET_PENDING},
+        "minutes_ago": 4,
+    },
     {
         "channel": CHANNEL_TAKEOUT,
         "items": [("Arroz de Camarón", 1)],
@@ -1701,6 +1733,8 @@ async def _create_order(
         dining_table_id=tables[entry["table"]].id if "table" in entry else None,
         customer_id=customers[entry["customer"]].id if "customer" in entry else None,
         employee_id=employee.id,
+        diner_name=entry.get("diner_name"),
+        origin=entry.get("origin", "staff"),
         status=status,
         kitchen_state=kitchen_state,
         subtotal=Decimal("0.00"),

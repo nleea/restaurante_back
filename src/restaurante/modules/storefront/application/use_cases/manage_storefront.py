@@ -32,9 +32,14 @@ from restaurante.modules.delivery.application.use_cases.manage_delivery import (
 )
 from restaurante.modules.orders.application.use_cases.manage_orders import OrderService
 from restaurante.modules.orders.domain.entities import Order
-from restaurante.modules.storefront.domain.entities import StoreBranch, StoreMenu
+from restaurante.modules.storefront.domain.entities import (
+    StoreBranch,
+    StoreMenu,
+    StoreTable,
+)
 from restaurante.modules.storefront.domain.ports import (
     DeliveryReadiness,
+    KitchenDispatch,
     StorefrontRepository,
 )
 from restaurante.shared.customer_channel.ports import (
@@ -44,11 +49,19 @@ from restaurante.shared.customer_channel.ports import (
     CustomerChannelDirectory,
     CustomerNotifier,
 )
-from restaurante.shared.domain.errors import BranchNotFoundError, ValidationError
+from restaurante.shared.domain.errors import (
+    BranchNotFoundError,
+    TableNotFoundError,
+    ValidationError,
+)
 
 _PICKUP = "pickup"
 _DELIVERY = "delivery"
 _CHANNEL_PICKUP = "takeaway"
+_CHANNEL_DINE_IN = "dine_in"
+# El sello que distingue "el cliente escaneó el QR de su mesa" de "el mesero lo tomó". Mismo
+# canal, mismo empleado de sistema, misma mesa: sin el sello son indistinguibles.
+_ORIGIN_QR = "qr"
 # El único método que NO deja el pedido debiendo: se cobra en la puerta. Cualquier otro nace
 # prepago y sin verificar, y por eso su acuse es otro.
 _METHOD_CASH = "cash"
@@ -70,6 +83,19 @@ class OrderLineCommand:
     addon_ids: list[uuid.UUID] = field(default_factory=list)
     removed_ingredients: list[str] = field(default_factory=list)
     note: str | None = None
+
+
+@dataclass
+class TableOrderCommand:
+    """Lo que el comensal manda al confirmar desde el QR de su mesa.
+
+    No trae teléfono ni tipo de entrega, y eso NO es una simplificación: no hay nada que
+    entregar —la comida sale a la mesa que ya venía en la URL— y pedir un teléfono para almorzar
+    es fricción que nadie acepta sentado. Tampoco trae método de pago: se paga al cerrar.
+    """
+
+    diner_name: str
+    lines: list[OrderLineCommand]
 
 
 @dataclass
@@ -117,6 +143,7 @@ class StorefrontService:
         channel_directory: CustomerChannelDirectory | None = None,
         customer_notifier: CustomerNotifier | None = None,
         delivery_readiness: DeliveryReadiness | None = None,
+        kitchen: KitchenDispatch | None = None,
     ) -> None:
         self._repo = repo
         self._orders = order_service
@@ -129,6 +156,10 @@ class StorefrontService:
         # Sin él se acepta todo, como antes. Con él, una sede que no puede cotizar un domicilio
         # lo dice ANTES de tomarlo, en vez de dejar al cliente esperando un enlace imposible.
         self._delivery_readiness = delivery_readiness
+        # Sólo lo usa el pedido de mesa. Opcional como los demás puertos de salida: sin él, la
+        # carta pública sigue sirviendo exactamente igual y el pedido de mesa queda pendiente,
+        # que es el comportamiento del resto del storefront.
+        self._kitchen = kitchen
 
     async def resolve_store_token(
         self, tenant_id: uuid.UUID, token: str
@@ -165,6 +196,114 @@ class StorefrontService:
     async def list_branches(self, tenant_id: uuid.UUID) -> list[StoreBranch]:
         """Active branches for the public picker."""
         return await self._repo.list_active_branches(tenant_id)
+
+    async def resolve_table(
+        self, tenant_id: uuid.UUID, branch_id: uuid.UUID, code: str
+    ) -> StoreTable:
+        """La mesa detrás del QR. Lectura pura: escanear NO ocupa la mesa.
+
+        Ocuparla aquí dejaría marcada como ocupada cualquier mesa que alguien escanee de paso
+        —sin nadie sentado— y el Salón la retiraría del servicio. Una mesa se ocupa cuando hay
+        comida en camino, y eso pasa al confirmar.
+
+        Un código desconocido, una mesa desactivada o una mesa de otra sede son lo mismo: 404.
+        Nunca otra mesa.
+        """
+        table = await self._repo.get_active_table_by_code(tenant_id, branch_id, code)
+        if table is None:
+            raise TableNotFoundError(f"Mesa no encontrada: {code}")
+        return table
+
+    async def create_table_order(
+        self,
+        tenant_id: uuid.UUID,
+        branch_id: uuid.UUID,
+        table_id: uuid.UUID,
+        command: TableOrderCommand,
+    ) -> Order:
+        """El pedido de mesa: se crea Y SE ENVÍA A COCINA en la misma operación.
+
+        Ésta es la excepción deliberada a la regla del storefront, que deja los pedidos
+        pendientes de que el personal los confirme. La razón de aquella regla es que un pedido
+        web lo hace un desconocido a distancia y el negocio quiere una mirada humana antes de
+        gastar insumos. En la mesa, quien confirma está sentado en el local, delante del plato
+        que va a pagar: la revisión que en el web hace el personal, aquí la hace el propio
+        cliente mirando su carrito antes de pulsar «Confirmar».
+
+        Confirmar ES el compromiso. Por eso enruta, y por eso cada confirmación posterior desde
+        el enlace es otra ronda que también entra sola (`edit_order` ya lo hace).
+
+        Sin método de pago: se paga al cerrar. El portón de pago de cocina trata un pedido sin
+        método como efectivo —"su plata llega en la puerta"—, así que no hace falta ninguna
+        excepción ahí.
+        """
+        if not command.lines:
+            raise ValidationError("El pedido no tiene productos.")
+        diner = command.diner_name.strip()
+        if not diner:
+            raise ValidationError("Falta el nombre de quien pide.")
+
+        # Todo se valida ANTES de escribir nada: un pedido rechazado no puede dejar media
+        # comanda ni un tiquete suelto en el pase.
+        resolved = await self._resolve_lines(tenant_id, branch_id, command.lines)
+
+        employee_id = await self._repo.resolve_system_employee(tenant_id, branch_id)
+        order = await self._orders.open_order(
+            tenant_id,
+            branch_id,
+            _CHANNEL_DINE_IN,
+            employee_id,
+            dining_table_id=table_id,
+            diner_name=diner,
+            origin=_ORIGIN_QR,
+        )
+        assert order.id is not None
+
+        for line in resolved:
+            note = self._compose_note(
+                line.command.removed_ingredients, line.command.note
+            )
+            item = await self._orders.add_item(
+                tenant_id,
+                order.id,
+                line.command.variant_id,
+                line.command.quantity,
+                line.unit_price,
+                notes=note,
+            )
+            assert item.id is not None
+            for addon_id, applied_price in line.addon_prices:
+                await self._orders.attach_addon(
+                    tenant_id, item.id, addon_id, applied_price
+                )
+
+        # El enlace con el que el comensal seguirá el pedido y pedirá otra ronda. Se acuña en
+        # todos los caminos públicos por lo mismo: es el único momento en que sabemos con
+        # certeza que quien tiene delante la pantalla es el dueño del pedido.
+        await self._orders.mint_edit_token(tenant_id, order.id)
+
+        # Y AQUÍ está la excepción, con su porqué al lado a propósito. Sin esta línea el pedido
+        # se queda esperando a un mesero que en este negocio puede no existir, que es justo lo
+        # que esta capacidad viene a resolver. No es una incoherencia con el resto del
+        # storefront: es la diferencia entre un desconocido a distancia y alguien sentado en
+        # una mesa del local.
+        if self._kitchen is not None:
+            await self._kitchen.route_order(tenant_id, order.id)
+
+        refreshed = await self._orders.get_order(tenant_id, order.id)
+        return refreshed if refreshed is not None else order
+
+    async def can_take_orders(
+        self, tenant_id: uuid.UUID, branch_id: uuid.UUID
+    ) -> bool:
+        """¿Puede esta sede recibir un pedido ahora mismo?
+
+        Es la caja, que es el portón de verdad de `open_order`. Se consulta al resolver la mesa
+        para poder decírselo al comensal ANTES del carrito: hacerle montar el pedido para
+        rechazárselo en el último paso es hacerle perder el tiempo por algo que se sabía en la
+        primera petición.
+        """
+        return await self._repo.has_open_cash_session(tenant_id, branch_id)
 
     async def get_menu(
         self, tenant_id: uuid.UUID, branch_id: uuid.UUID | None

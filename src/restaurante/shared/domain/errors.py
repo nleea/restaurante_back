@@ -58,6 +58,18 @@ class BranchNotFoundError(DomainError):
     code = "branch_not_found"
 
 
+class TableNotFoundError(DomainError):
+    """El código de mesa del QR no corresponde a ninguna mesa activa de esa sede.
+
+    Código propio, hermano de `branch_not_found` y por el mismo motivo: quien lo recibe está
+    de pie delante de una calcomanía con el teléfono en la mano, y necesita que le digan que el
+    código no vale —para volver a escanear o llamar a alguien— y no un 404 genérico ni, mucho
+    peor, una carta vacía. Nunca se cae a otra mesa.
+    """
+
+    code = "table_not_found"
+
+
 class ConflictError(DomainError):
     """La operación choca con el estado actual (dependientes, duplicado, etc.)."""
 

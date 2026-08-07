@@ -9,6 +9,7 @@ from typing import Protocol
 from restaurante.modules.storefront.domain.entities import (
     StoreBranch,
     StoreMenu,
+    StoreTable,
     StoreVariant,
 )
 
@@ -29,6 +30,21 @@ class DeliveryReadiness(Protocol):
     async def can_take_deliveries(
         self, tenant_id: uuid.UUID, branch_id: uuid.UUID
     ) -> bool: ...
+
+
+class KitchenDispatch(Protocol):
+    """Puerto de salida: enviar a cocina lo que hay sin enviar de un pedido.
+
+    Lo usan los dos caminos en los que el CLIENTE confirma —el pedido de mesa por QR y cada
+    ronda que añade después desde su enlace—, que son justo los dos sitios donde no hay un
+    mesero en medio. Opcional en ambos: sin adaptador enchufado no se enruta nada, que es el
+    comportamiento del resto de la carta pública.
+
+    Puerto y no un import de `kitchen` por lo de siempre: la carta pública tiene que poder
+    servir sin el módulo de cocina montado.
+    """
+
+    async def route_order(self, tenant_id: uuid.UUID, order_id: uuid.UUID) -> None: ...
 
 
 class StorefrontRepository(Protocol):
@@ -54,6 +70,31 @@ class StorefrontRepository(Protocol):
         ``None`` must become a 404 upstream, never a fallback to the primary branch:
         the customer believing they ordered from one branch while the ticket prints in
         another is the failure this lookup exists to prevent.
+        """
+        ...
+
+    async def get_active_table_by_code(
+        self, tenant_id: uuid.UUID, branch_id: uuid.UUID, code: str
+    ) -> StoreTable | None:
+        """La mesa ACTIVA con ese código EN ESA SEDE, o ``None``.
+
+        La sede es parte de la búsqueda, no un filtro posterior: el código sólo es único dentro
+        de su sucursal, y aceptar el de otra sede haría que un pedido saliera en una cocina
+        distinta de la carta que el cliente estuvo mirando.
+
+        ``None`` tiene que convertirse en 404 arriba y NUNCA en otra mesa, por el mismo motivo
+        por el que resolver la sede no cae a la principal.
+        """
+        ...
+
+    async def has_open_cash_session(
+        self, tenant_id: uuid.UUID, branch_id: uuid.UUID
+    ) -> bool:
+        """¿Hay caja abierta en esa sede ahora mismo?
+
+        Lectura, no portón: quien lo impide de verdad sigue siendo `open_order`. Existe para
+        poder DECÍRSELO al comensal antes de que arme el carrito, en vez de dejarle montar el
+        pedido y estrellarlo contra un conflicto en el último paso.
         """
         ...
 

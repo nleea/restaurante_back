@@ -39,6 +39,9 @@ class CashMovementResponse(BaseModel):
     method: str
     category: str
     reference_id: uuid.UUID | None = None
+    # La cuenta de mesa que produjo el movimiento, si la hubo. Cobrar una mesa deja un
+    # movimiento por comanda; esto es lo que deja al feed decir que fueron UN solo cobro.
+    table_bill_id: uuid.UUID | None = None
     created_at: datetime
 
 

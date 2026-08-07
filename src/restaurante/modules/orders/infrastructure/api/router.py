@@ -8,11 +8,13 @@ orders (items, addons, discount, close, receipts) `orders.update`; cancellations
 from __future__ import annotations
 
 import uuid
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, Response, status
 from fastapi.responses import StreamingResponse
 
 from restaurante.modules.identity.infrastructure.api.deps import require_permission
+from restaurante.modules.orders.domain.bill_allocation import BillPayment
 from restaurante.modules.orders.infrastructure.api.deps import (
     EventStreamDep,
     OrderServiceDep,
@@ -23,28 +25,38 @@ from restaurante.modules.orders.infrastructure.api.schemas import (
     AddItemRequest,
     AssignCustomerRequest,
     AttachAddonRequest,
+    BillReceiptLine,
+    BillReceiptMember,
+    BillReceiptResponse,
     CancelRefundRequest,
     CancelRequest,
+    ChargeTableBillRequest,
     ConfirmRefundRequest,
     CreateDiningTableRequest,
     DiningTableResponse,
     OpenOrderRequest,
+    OpenTableBillRequest,
     OrderItemAddonResponse,
     OrderItemResponse,
     OrderPaymentResponse,
     OrderResponse,
     PaymentClaimResponse,
     ReceiptPrintResponse,
+    RecordBillReceiptRequest,
     RecordReceiptRequest,
     RefundResponse,
     RegisterPaymentRequest,
     RejectPaymentClaimRequest,
     SetDiscountRequest,
     SetItemNotesRequest,
+    TableBillMemberResponse,
+    TableBillResponse,
+    TableQrResponse,
     UpdateDiningTableRequest,
     UpdateItemQuantityRequest,
     VerifyPaymentRequest,
 )
+from restaurante.shared.domain.order_label import order_label
 from restaurante.shared.realtime.deps import event_stream_response
 
 router = APIRouter(prefix="/orders", tags=["orders"])
@@ -98,6 +110,26 @@ async def list_tables(
     return [DiningTableResponse.model_validate(t, from_attributes=True) for t in tables]
 
 
+@router.get(
+    "/tables/{table_id}/qr", response_model=TableQrResponse, dependencies=[_READ]
+)
+async def get_table_qr(
+    table_id: uuid.UUID, service: OrderServiceDep, tenant_id: TenantDep
+) -> TableQrResponse:
+    """El QR de esa mesa, listo para imprimir y pegar.
+
+    Devuelve el SVG y TAMBIÉN la URL que codifica. Un QR es opaco: si la única forma de saber a
+    dónde apunta fuera escanearlo, nadie comprobaría nada antes de imprimir diez calcomanías.
+
+    Gated por `orders.read` y no por un permiso nuevo: el código de la mesa no es un secreto —va
+    impreso a la vista de cualquiera que entre al local— así que lo que protege este endpoint no
+    es el dato, es el acceso al panel. Un permiso nuevo exigiría además sembrarlo, y sin
+    `scripts.seed` daría 403 a todo el mundo.
+    """
+    url, svg = await service.table_qr(tenant_id, table_id)
+    return TableQrResponse(url=url, svg=svg)
+
+
 @router.patch(
     "/tables/{table_id}", response_model=DiningTableResponse, dependencies=[_UPDATE]
 )
@@ -111,6 +143,153 @@ async def update_table(
         tenant_id, table_id, payload.model_dump(exclude_unset=True)
     )
     return DiningTableResponse.model_validate(table, from_attributes=True)
+
+
+# --- Table bills ------------------------------------------------------------
+# Sin permiso nuevo: cobrar una mesa es la MISMA autoridad que cobrar una comanda, ejercida
+# sobre varias a la vez. Un código nuevo habría que sembrarlo además, y sin `scripts.seed`
+# daría 403 a todo el mundo.
+async def _bill_response(
+    service: OrderServiceDep, tenant_id: uuid.UUID, bill_id: uuid.UUID
+) -> TableBillResponse:
+    bill, members, outstanding = await service.get_table_bill(tenant_id, bill_id)
+    assert bill.id is not None
+    rows = []
+    for member in members:
+        assert member.id is not None
+        paid = await service.paid_total(tenant_id, member.id)
+        rows.append(
+            TableBillMemberResponse(
+                order_id=member.id,
+                order_label=order_label(member.id),
+                diner_name=member.diner_name,
+                total=member.total,
+                paid=paid,
+                outstanding=max(member.total - paid, Decimal(0)),
+            )
+        )
+    return TableBillResponse(
+        id=bill.id,
+        branch_id=bill.branch_id,
+        dining_table_id=bill.dining_table_id,
+        status=bill.status,
+        total=bill.total,
+        members=rows,
+        outstanding=outstanding,
+        closed_at=bill.closed_at,
+    )
+
+
+@router.post(
+    "/table-bills", response_model=TableBillResponse, status_code=201, dependencies=[_UPDATE]
+)
+async def open_table_bill(
+    payload: OpenTableBillRequest, service: OrderServiceDep, tenant_id: TenantDep
+) -> TableBillResponse:
+    """Agrupa las comandas abiertas de una mesa para cobrarlas en un gesto.
+
+    Sin `order_ids` toma todas: casi todas las mesas pagan juntas.
+    """
+    bill, _ = await service.open_table_bill(
+        tenant_id, payload.dining_table_id, payload.employee_id, payload.order_ids
+    )
+    assert bill.id is not None
+    return await _bill_response(service, tenant_id, bill.id)
+
+
+@router.get(
+    "/table-bills/{bill_id}", response_model=TableBillResponse, dependencies=[_READ]
+)
+async def get_table_bill(
+    bill_id: uuid.UUID, service: OrderServiceDep, tenant_id: TenantDep
+) -> TableBillResponse:
+    return await _bill_response(service, tenant_id, bill_id)
+
+
+@router.get(
+    "/table-bills/{bill_id}/receipt",
+    response_model=BillReceiptResponse,
+    dependencies=[_READ],
+)
+async def get_bill_receipt(
+    bill_id: uuid.UUID, service: OrderServiceDep, tenant_id: TenantDep
+) -> BillReceiptResponse:
+    """Los datos de la tirilla, ya juntos. Leer no imprime: registrar la impresión es otro POST."""
+    data = await service.bill_receipt(tenant_id, bill_id)
+    bill = data["bill"]
+    return BillReceiptResponse(
+        bill_id=bill.id,
+        business_name=data["business_name"],
+        tax_id=data["tax_id"],
+        business_address=data["business_address"],
+        branch_name=data["branch_name"],
+        table_number=data["table_number"],
+        total=sum((m["total"] for m in data["members"]), Decimal(0)),
+        methods=data["methods"],
+        members=[
+            BillReceiptMember(
+                order_id=m["order_id"],
+                order_label=order_label(m["order_id"]),
+                diner_name=m["diner_name"],
+                total=m["total"],
+                lines=[BillReceiptLine(**line) for line in m["lines"]],
+            )
+            for m in data["members"]
+        ],
+        closed_at=bill.closed_at,
+    )
+
+
+@router.delete("/table-bills/{bill_id}", status_code=_NO_CONTENT, dependencies=[_UPDATE])
+async def dissolve_table_bill(
+    bill_id: uuid.UUID, service: OrderServiceDep, tenant_id: TenantDep
+) -> Response:
+    """Deshace la agrupación. Los miembros salen intactos: no se cobró ni se cerró nada."""
+    await service.dissolve_table_bill(tenant_id, bill_id)
+    return Response(status_code=_NO_CONTENT)
+
+
+@router.post(
+    "/table-bills/{bill_id}/payments",
+    response_model=TableBillResponse,
+    dependencies=[_PAY],
+)
+async def charge_table_bill(
+    bill_id: uuid.UUID,
+    payload: ChargeTableBillRequest,
+    service: OrderServiceDep,
+    tenant_id: TenantDep,
+) -> TableBillResponse:
+    """Cobra la cuenta. Si cubre, cierra a todos sus miembros en la MISMA transacción.
+
+    Un cobro parcial es legítimo —el cajero recibe lo que le den— y deja la cuenta abierta con
+    lo cobrado ya registrado. Lo que no hace es cerrar nada a medias.
+    """
+    await service.charge_table_bill(
+        tenant_id,
+        bill_id,
+        [BillPayment(amount=p.amount, method=p.method) for p in payload.payments],
+        payload.employee_id,
+    )
+    return await _bill_response(service, tenant_id, bill_id)
+
+
+@router.post(
+    "/table-bills/{bill_id}/receipts",
+    response_model=ReceiptPrintResponse,
+    status_code=201,
+    dependencies=[_UPDATE],
+)
+async def record_bill_receipt(
+    bill_id: uuid.UUID,
+    payload: RecordBillReceiptRequest,
+    service: OrderServiceDep,
+    tenant_id: TenantDep,
+) -> ReceiptPrintResponse:
+    receipt = await service.record_receipt_print(
+        tenant_id, payload.employee_id, table_bill_id=bill_id
+    )
+    return ReceiptPrintResponse.model_validate(receipt, from_attributes=True)
 
 
 # --- Orders -----------------------------------------------------------------
@@ -234,7 +413,7 @@ async def record_receipt(
     tenant_id: TenantDep,
 ) -> ReceiptPrintResponse:
     receipt = await service.record_receipt_print(
-        tenant_id, order_id, payload.employee_id
+        tenant_id, payload.employee_id, order_id=order_id
     )
     return ReceiptPrintResponse.model_validate(receipt, from_attributes=True)
 

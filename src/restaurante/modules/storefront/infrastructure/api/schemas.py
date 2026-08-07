@@ -138,6 +138,21 @@ class CreateStorefrontOrderRequest(_RequestModel):
     )
 
 
+class CreateTableOrderRequest(_RequestModel):
+    """Lo que manda el comensal al pulsar «Confirmar».
+
+    Ni sede ni mesa: las dos vienen de la RUTA. Aceptarlas aquí dejaría que un pedido
+    contradijera la carta que el cliente estuvo mirando, que es exactamente lo que el diseño
+    direccionado por URL existe para impedir.
+
+    Ni teléfono ni tipo de entrega ni método de pago: no hay nada que entregar —la comida sale a
+    la mesa— y se paga al cerrar.
+    """
+
+    diner_name: str = Field(min_length=1, max_length=60, alias="dinerName")
+    lines: list[StorefrontLineRequest] = Field(min_length=1)
+
+
 class StorefrontSessionResponse(_CamelModel):
     """A quién resuelve el token del enlace: sólo lo que precarga el checkout.
 
@@ -189,6 +204,22 @@ class StorefrontBranchResponse(_CamelModel):
     name: str
     address: str | None = None
     phone: str | None = None
+
+
+class StorefrontTableResponse(_CamelModel):
+    """La mesa detrás del QR, más si el negocio puede atender ahora mismo.
+
+    `can_order_now` viene AQUÍ, en la primera petición, y no se descubre al confirmar: dejar que
+    el comensal arme el carrito para rechazárselo en el último paso es hacerle perder el tiempo
+    por algo que ya se sabía. No es el portón —el portón sigue siendo la caja en `open_order`—,
+    es lo que permite decirlo a tiempo.
+    """
+
+    id: uuid.UUID
+    number: str
+    branch_id: uuid.UUID
+    branch_name: str
+    can_order_now: bool
 
 
 # --- "Mi pedido": lectura por token -----------------------------------------

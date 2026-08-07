@@ -29,6 +29,7 @@ from restaurante.shared.domain.errors import (
     DomainError,
     InvalidTokenError,
     NotFoundError,
+    TableNotFoundError,
     TenantNotResolvedError,
     ValidationError,
 )
@@ -41,6 +42,7 @@ _STATUS_BY_ERROR: dict[type[DomainError], int] = {
     AuthorizationError: status.HTTP_403_FORBIDDEN,
     NotFoundError: status.HTTP_404_NOT_FOUND,
     BranchNotFoundError: status.HTTP_404_NOT_FOUND,
+    TableNotFoundError: status.HTTP_404_NOT_FOUND,
     TenantNotResolvedError: status.HTTP_404_NOT_FOUND,
     ConflictError: status.HTTP_409_CONFLICT,
     CashClosedError: status.HTTP_409_CONFLICT,

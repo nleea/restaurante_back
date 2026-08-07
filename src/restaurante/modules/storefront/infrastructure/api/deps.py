@@ -48,6 +48,7 @@ from restaurante.modules.orders.application.use_cases.manage_payments import (
     PaymentService,
 )
 from restaurante.modules.orders.infrastructure.api.deps import (
+    build_orders_payment_gate,
     build_orders_readiness,
     get_order_service,
     get_payment_service,
@@ -85,6 +86,27 @@ def get_appearance_service(session: SessionDep) -> AppearanceService:
 AppearanceServiceDep = Annotated[AppearanceService, Depends(get_appearance_service)]
 
 
+class _KitchenDispatchAdapter:
+    """Adapta la cocina al puerto `KitchenDispatch` del storefront.
+
+    Vive en el composition root para que la aplicación del storefront no importe cocina. El
+    adaptador es neutral: quién decide si hay puerta de pago es quien construye el
+    `KitchenService` que se le pasa, y los dos usuarios eligen distinto a propósito.
+
+    - **Pedido de mesa** (`get_storefront_service`): CON puerta. Es el primer enrutado de una
+      comanda nueva, exactamente igual que si lo enrutara el personal.
+    - **Rondas siguientes** (`get_order_edit_service`): SIN puerta. Ahí se reenruta un pedido
+      que YA cruzó la puerta una vez, y volver a preguntarla sólo podría dar un falso "no" —
+      que dejaría unas papas facturadas que nadie cocina.
+    """
+
+    def __init__(self, kitchen: KitchenService) -> None:
+        self._kitchen = kitchen
+
+    async def route_order(self, tenant_id: uuid.UUID, order_id: uuid.UUID) -> None:
+        await self._kitchen.route_order(tenant_id, order_id)
+
+
 def get_storefront_service(session: SessionDep) -> StorefrontService:
     # Un solo canal para las dos cosas que el storefront le pide: resolver el token del
     # enlace y avisar "recibimos tu pedido".
@@ -100,28 +122,22 @@ def get_storefront_service(session: SessionDep) -> StorefrontService:
         # cliente en el checkout es peor noticia dada honestamente; aceptarlo lo deja esperando
         # un enlace de pago que nadie va a poder emitir.
         delivery_readiness=SqlAlchemyDeliveryReadiness(session),
+        # Sólo lo usa el pedido de mesa por QR, y va CON la puerta de pago, al contrario que el
+        # adaptador de `get_order_edit_service`: aquél reenruta un pedido que ya cruzó la
+        # puerta una vez, y éste es el PRIMER enrutado de una comanda nueva. Un pedido de mesa
+        # no elige método —se paga al cerrar— y la puerta trata eso como efectivo, así que
+        # pasa; tenerla puesta es lo que hace que siga pasando si algún día eso cambia.
+        kitchen=_KitchenDispatchAdapter(
+            KitchenService(
+                repo=SqlAlchemyKitchenRepository(session),
+                orders_readiness=build_orders_readiness(session),
+                orders_payment=build_orders_payment_gate(session),
+            )
+        ),
     )
 
 
 StorefrontServiceDep = Annotated[StorefrontService, Depends(get_storefront_service)]
-
-
-class _KitchenDispatchAdapter:
-    """Adapta la cocina al puerto `KitchenDispatch` del storefront.
-
-    Vive en el composition root para que la aplicación del storefront no importe cocina.
-    Deliberadamente SIN la puerta de pago (`orders_payment`), igual que la ruta que usa
-    `get_order_service`: por aquí sólo se enruta un pedido que YA está en cocina, así que la
-    puerta ya se cruzó una vez. Volver a preguntarla sólo podría dar un falso "no" — y un
-    falso "no" aquí deja unas papas facturadas que nadie cocina, que es el fallo que este
-    adaptador existe para evitar.
-    """
-
-    def __init__(self, kitchen: KitchenService) -> None:
-        self._kitchen = kitchen
-
-    async def route_order(self, tenant_id: uuid.UUID, order_id: uuid.UUID) -> None:
-        await self._kitchen.route_order(tenant_id, order_id)
 
 
 def get_order_edit_service(session: SessionDep) -> OrderEditService:

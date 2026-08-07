@@ -13,21 +13,29 @@ import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 
+from restaurante.modules.orders.domain.bill_allocation import (
+    BillMember,
+    BillPayment,
+    allocate,
+)
 from restaurante.modules.orders.domain.entities import (
     Cancellation,
     DiningTable,
     Order,
     OrderItem,
     OrderItemAddon,
+    OrderPayment,
     ReceiptPrint,
+    TableBill,
 )
 from restaurante.modules.orders.domain.ports import (
     DeliveryDispatch,
     KitchenRouting,
     OrdersRepository,
 )
+from restaurante.modules.orders.domain.table_qr import table_qr_svg
 from restaurante.shared.customer_channel.ports import (
     CUSTOMER_STATE_CANCELLED,
     CUSTOMER_STATE_READY,
@@ -39,6 +47,7 @@ from restaurante.shared.domain.errors import (
     NotFoundError,
     ValidationError,
 )
+from restaurante.shared.links import table_order_url
 from restaurante.shared.realtime.ports import EventPublisher
 
 # Live-board topic for the Salón surface (floor: tables + orders).
@@ -47,6 +56,15 @@ EVENT_TOPIC = "orders"
 CHANNELS = ("dine_in", "takeaway", "delivery")
 CHANNEL_DELIVERY = "delivery"
 
+# De dónde vino la comanda. Es distinto del canal: el canal dice CÓMO se entrega (en mesa, para
+# llevar, a domicilio) y el origen dice QUIÉN la levantó. Un `dine_in` del mesero y uno del
+# cliente escaneando el QR de su mesa comparten canal, empleado de sistema y mesa, y sólo el
+# origen los separa — que es lo que necesitan la cocina, el Salón y los reportes.
+ORIGIN_STAFF = "staff"
+ORIGIN_WEB = "web"
+ORIGIN_QR = "qr"
+ORIGINS = (ORIGIN_STAFF, ORIGIN_WEB, ORIGIN_QR)
+
 logger = logging.getLogger(__name__)
 
 ORDER_OPEN = "open"
@@ -54,6 +72,9 @@ ORDER_CLOSED = "closed"
 ORDER_CANCELLED = "cancelled"
 
 ITEM_CANCELLED = "cancelled"
+
+BILL_OPEN = "open"
+BILL_SETTLED = "settled"
 
 TABLE_FREE = "free"
 TABLE_OCCUPIED = "occupied"
@@ -83,8 +104,16 @@ class OrderService:
         delivery_dispatch: DeliveryDispatch | None = None,
         events: EventPublisher | None = None,
         customer_notifier: CustomerNotifier | None = None,
+        storefront_base_url: str = "",
     ) -> None:
         self._repo = repo
+        # El dominio público de la carta, SIN el subdominio del tenant (se antepone al
+        # construir). Se inyecta desde el composition root en vez de leer `get_settings()`
+        # aquí, como ya hace messaging: un caso de uso que lee configuración global no se
+        # puede probar con dos dominios distintos sin tocar el entorno.
+        #
+        # Vacío = no hay dominio configurado, y entonces no se puede imprimir ningún QR.
+        self._storefront_base_url = storefront_base_url
         # Optional outbound port: when wired, adding an item auto-routes the order to the kitchen.
         self._kitchen_routing = kitchen_routing
         # Optional outbound port: when wired, a ready delivery order auto-creates its dispatch
@@ -171,10 +200,25 @@ class OrderService:
         return item
 
     async def _free_table(self, tenant_id: uuid.UUID, order: Order) -> None:
-        if order.dining_table_id is not None:
-            await self._repo.update_dining_table(
-                tenant_id, order.dining_table_id, {"status": TABLE_FREE}
-            )
+        """Libera la mesa sólo si esta comanda era la última abierta en ella.
+
+        Liberar sin condición era correcto mientras una mesa sostenía una sola comanda. Deja de
+        serlo en cuanto cada comensal tiene la suya —que es justo lo que trae el pedido por QR—:
+        el primero que paga marcaría la mesa 5 libre con tres personas comiendo en ella, y el
+        Salón se la ofrecería al siguiente que entrara por la puerta.
+
+        A una mesa la sostiene la comida que hay encima, no quien liquida primero.
+        """
+        if order.dining_table_id is None:
+            return
+        remaining = await self._repo.count_open_orders_on_table(
+            tenant_id, order.dining_table_id, exclude_order_id=order.id
+        )
+        if remaining:
+            return
+        await self._repo.update_dining_table(
+            tenant_id, order.dining_table_id, {"status": TABLE_FREE}
+        )
 
     async def _release_delivery(self, tenant_id: uuid.UUID, order: Order) -> None:
         """Suelta la entrega de una comanda que deja de existir. El gemelo de `_free_table`.
@@ -226,6 +270,41 @@ class OrderService:
         await self._require_branch(tenant_id, branch_id)
         return await self._repo.list_dining_tables(tenant_id, branch_id)
 
+    async def table_qr(
+        self, tenant_id: uuid.UUID, table_id: uuid.UUID
+    ) -> tuple[str, str]:
+        """El QR de UNA mesa: devuelve `(url, svg)`.
+
+        Devuelve las dos cosas y no sólo el dibujo porque quien lo imprime necesita poder
+        comprobar a dónde apunta antes de pegarlo en una madera. Un QR es opaco por definición:
+        si el único modo de saber qué codifica es escanearlo, nadie revisa nada y el error se
+        descubre con un cliente sentado delante.
+
+        Falla —y no devuelve media cosa— cuando no hay dominio público configurado. Un QR
+        construido sobre una base vacía sería perfectamente legible y llevaría a ninguna parte,
+        y eso no se nota hasta que ya está impreso diez veces.
+        """
+        table = await self._repo.get_dining_table(tenant_id, table_id)
+        if table is None:
+            raise NotFoundError(f"Mesa no encontrada: {table_id}")
+        if not table.code:
+            raise ValidationError("Esa mesa todavía no tiene código para su QR.")
+
+        slug = await self._repo.tenant_slug(tenant_id)
+        branch_code = await self._repo.branch_code(tenant_id, table.branch_id)
+        if not branch_code:
+            raise ValidationError("La sucursal de esa mesa no tiene código público.")
+
+        url = table_order_url(
+            self._storefront_base_url, slug, branch_code, table.code
+        )
+        if not url:
+            raise ValidationError(
+                "No hay dominio público configurado (STOREFRONT_BASE_URL): "
+                "sin él, el QR de la mesa apuntaría a ninguna parte."
+            )
+        return url, table_qr_svg(url)
+
     async def update_dining_table(
         self, tenant_id: uuid.UUID, table_id: uuid.UUID, fields: dict[str, Any]
     ) -> DiningTable:
@@ -249,9 +328,13 @@ class OrderService:
         customer_id: uuid.UUID | None = None,
         whatsapp_contact_id: uuid.UUID | None = None,
         payment_method: str | None = None,
+        diner_name: str | None = None,
+        origin: str = ORIGIN_STAFF,
     ) -> Order:
         if channel not in CHANNELS:
             raise ValidationError(f"Canal inválido: {channel}")
+        if origin not in ORIGINS:
+            raise ValidationError(f"Origen inválido: {origin}")
         await self._require_branch(tenant_id, branch_id)
         await self._require_employee(tenant_id, employee_id)
         if dining_table_id is not None:
@@ -274,6 +357,8 @@ class OrderService:
                 branch_id=branch_id,
                 channel=channel,
                 employee_id=employee_id,
+                diner_name=diner_name,
+                origin=origin,
                 dining_table_id=dining_table_id,
                 customer_id=customer_id,
                 whatsapp_contact_id=whatsapp_contact_id,
@@ -287,6 +372,185 @@ class OrderService:
             )
         await self._publish(tenant_id, branch_id, "created")
         return order
+
+    # --- La cuenta de mesa ---------------------------------------------------
+    async def open_table_bill(
+        self,
+        tenant_id: uuid.UUID,
+        dining_table_id: uuid.UUID,
+        employee_id: uuid.UUID,
+        order_ids: list[uuid.UUID] | None = None,
+    ) -> tuple[TableBill, list[Order]]:
+        """Agrupa las comandas abiertas de una mesa para cobrarlas en un gesto.
+
+        Sin `order_ids` toma TODAS las abiertas de la mesa, que es el caso común: casi todas
+        las mesas pagan juntas. Separar no es otro camino —es esta misma cuenta con menos
+        miembros—, y por eso "Ana y Luis juntos, Sofía aparte" son dos cuentas y ninguna es un
+        caso especial.
+
+        La cuenta NO congela importe: entre abrir y cobrar, alguien puede pedir un café.
+        """
+        table = await self._repo.get_dining_table(tenant_id, dining_table_id)
+        if table is None:
+            raise NotFoundError(f"Mesa no encontrada: {dining_table_id}")
+        await self._require_employee(tenant_id, employee_id)
+
+        open_orders = await self._repo.list_orders(
+            tenant_id, branch_id=table.branch_id, status=ORDER_OPEN,
+            dining_table_id=dining_table_id,
+        )
+        by_id = {o.id: o for o in open_orders}
+        if order_ids is None:
+            wanted = [o.id for o in open_orders if o.id is not None]
+        else:
+            wanted = list(order_ids)
+            for oid in wanted:
+                if oid not in by_id:
+                    # Una comanda de otra mesa, ya cerrada o inexistente: las tres son el mismo
+                    # error para quien cobra —"esa no puede ir en esta cuenta"— y separarlas
+                    # sólo le diría a un curioso qué comandas existen.
+                    raise ValidationError(
+                        "Esa comanda no está abierta en esta mesa."
+                    )
+        if not wanted:
+            raise ValidationError("La mesa no tiene comandas abiertas que cobrar.")
+
+        async with self._repo.unit_of_work():
+            bill = await self._repo.create_table_bill(
+                TableBill(
+                    tenant_id=tenant_id,
+                    branch_id=table.branch_id,
+                    dining_table_id=dining_table_id,
+                    opened_by_employee_id=employee_id,
+                )
+            )
+            assert bill.id is not None
+            claimed = await self._repo.claim_orders_for_bill(tenant_id, bill.id, wanted)
+            if claimed != len(wanted):
+                # La reclamación es atómica, así que llegar aquí significa que otro cajero se
+                # llevó alguna entre que la leímos y la escribimos. El rollback lo hace el
+                # propio `unit_of_work` al propagar.
+                raise ConflictError(
+                    "Otra cuenta ya está cobrando alguna de esas comandas."
+                )
+            members = await self._repo.list_bill_members(tenant_id, bill.id)
+        return bill, members
+
+    async def dissolve_table_bill(
+        self, tenant_id: uuid.UUID, bill_id: uuid.UUID
+    ) -> None:
+        """Deshace la agrupación. Los miembros salen intactos: no se cobró ni se cerró nada."""
+        bill = await self._repo.get_table_bill(tenant_id, bill_id)
+        if bill is None:
+            raise NotFoundError(f"Cuenta no encontrada: {bill_id}")
+        if bill.status != BILL_OPEN:
+            raise ConflictError("Esa cuenta ya está liquidada.")
+        async with self._repo.unit_of_work():
+            await self._repo.release_bill_orders(tenant_id, bill_id)
+            await self._repo.delete_table_bill(tenant_id, bill_id)
+
+    async def get_table_bill(
+        self, tenant_id: uuid.UUID, bill_id: uuid.UUID
+    ) -> tuple[TableBill, list[Order], Decimal]:
+        """La cuenta, sus miembros en orden de reparto, y lo que falta por cubrir AHORA."""
+        bill = await self._repo.get_table_bill(tenant_id, bill_id)
+        if bill is None:
+            raise NotFoundError(f"Cuenta no encontrada: {bill_id}")
+        members = await self._repo.list_bill_members(tenant_id, bill_id)
+        outstanding = Decimal(0)
+        for member in members:
+            assert member.id is not None
+            paid = await self._repo.payments_total(tenant_id, member.id)
+            outstanding += max(member.total - paid, Decimal(0))
+        return bill, members, outstanding
+
+    async def bill_receipt(
+        self, tenant_id: uuid.UUID, bill_id: uuid.UUID
+    ) -> dict[str, Any]:
+        """Los datos de la tirilla de una cuenta."""
+        data = await self._repo.bill_receipt_data(tenant_id, bill_id)
+        if data is None:
+            raise NotFoundError(f"Cuenta no encontrada: {bill_id}")
+        return data
+
+    async def paid_total(
+        self, tenant_id: uuid.UUID, order_id: uuid.UUID
+    ) -> Decimal:
+        """Lo cobrado de una comanda. `order_payments` es la única verdad de "pagado"."""
+        return await self._repo.payments_total(tenant_id, order_id)
+
+    async def charge_table_bill(
+        self,
+        tenant_id: uuid.UUID,
+        bill_id: uuid.UUID,
+        payments: list[BillPayment],
+        employee_id: uuid.UUID,
+    ) -> tuple[TableBill, Decimal]:
+        """Cobra la cuenta: reparte en cascada y, si cubre, cierra a todos sus miembros.
+
+        Todo va dentro de UNA transacción. Un fallo a mitad que dejara a Ana cerrada y a Sofía
+        cobrada sin cerrar es el peor resultado posible de esta capacidad, y el sistema no debe
+        poder alcanzarlo.
+
+        Cada comanda se cierra por `close_order`, SIN tocarlo: llega con sus pagos cubriendo su
+        total de verdad, no por excepción. La regla que impidió que un cierre sin pagar hiciera
+        desaparecer ventas de la caja sigue exactamente igual.
+
+        Devuelve la cuenta y lo que quedó sin cubrir. Un cobro parcial es legítimo —el cajero
+        recibe lo que le den— y deja la cuenta abierta: lo que NO se hace es cerrar nada.
+        """
+        bill = await self._repo.get_table_bill(tenant_id, bill_id)
+        if bill is None:
+            raise NotFoundError(f"Cuenta no encontrada: {bill_id}")
+        if bill.status != BILL_OPEN:
+            raise ConflictError("Esa cuenta ya está liquidada.")
+        await self._require_employee(tenant_id, employee_id)
+        for payment in payments:
+            if payment.amount <= 0:
+                raise ValidationError("El monto del pago debe ser positivo.")
+
+        session = await self._repo.get_open_cash_session(tenant_id, bill.branch_id)
+        if session is None:
+            raise ConflictError(
+                "No hay sesión de caja abierta en la sucursal para registrar el pago."
+            )
+        assert session.id is not None
+
+        members = await self._repo.list_bill_members(tenant_id, bill_id)
+        allocation_members: list[BillMember] = []
+        total = Decimal(0)
+        for member in members:
+            assert member.id is not None
+            paid = await self._repo.payments_total(tenant_id, member.id)
+            owed = max(member.total - paid, Decimal(0))
+            total += member.total
+            allocation_members.append(BillMember(order_id=member.id, outstanding=owed))
+
+        result = allocate(allocation_members, payments)
+
+        async with self._repo.unit_of_work():
+            for alloc in result.allocations:
+                await self._repo.register_payment(
+                    OrderPayment(
+                        tenant_id=tenant_id,
+                        branch_id=bill.branch_id,
+                        order_id=cast(uuid.UUID, alloc.order_id),
+                        cash_session_id=session.id,
+                        amount=alloc.amount,
+                        method=alloc.method,
+                        employee_id=employee_id,
+                    )
+                )
+            if result.uncovered == 0:
+                for member in members:
+                    assert member.id is not None
+                    await self.close_order(tenant_id, member.id)
+                await self._repo.settle_table_bill(tenant_id, bill_id, total)
+
+        updated = await self._repo.get_table_bill(tenant_id, bill_id)
+        assert updated is not None
+        await self._publish(tenant_id, bill.branch_id, "closed")
+        return updated, result.uncovered
 
     # --- El enlace de edición ------------------------------------------------
     async def mint_edit_token(
@@ -703,16 +967,48 @@ class OrderService:
         return updated
 
     async def record_receipt_print(
-        self, tenant_id: uuid.UUID, order_id: uuid.UUID, employee_id: uuid.UUID
+        self,
+        tenant_id: uuid.UUID,
+        employee_id: uuid.UUID,
+        *,
+        order_id: uuid.UUID | None = None,
+        table_bill_id: uuid.UUID | None = None,
     ) -> ReceiptPrint:
-        order = await self._require_order(tenant_id, order_id)
+        """Registra una impresión: de UNA comanda o de la cuenta de una mesa, nunca las dos.
+
+        La pregunta que responde esta tabla —"¿esto ya se imprimió, es reimpresión?"— es
+        idéntica para las dos, así que la responde una sola tabla. Dos tablas para una misma
+        pregunta se desincronizan.
+
+        Una impresión de cuenta NO marca a sus comandas miembro. Hacerlo pondría `is_reprint`
+        en comandas que nunca se imprimieron solas, y convertiría una auditoría honesta en
+        ruido.
+        """
+        if (order_id is None) == (table_bill_id is None):
+            raise ValidationError(
+                "Una impresión es de una comanda o de una cuenta de mesa, no de las dos ni de "
+                "ninguna."
+            )
         await self._require_employee(tenant_id, employee_id)
-        is_reprint = await self._repo.order_has_receipt(tenant_id, order_id)
+
+        if order_id is not None:
+            order = await self._require_order(tenant_id, order_id)
+            branch_id = order.branch_id
+            is_reprint = await self._repo.order_has_receipt(tenant_id, order_id)
+        else:
+            assert table_bill_id is not None
+            bill = await self._repo.get_table_bill(tenant_id, table_bill_id)
+            if bill is None:
+                raise NotFoundError(f"Cuenta no encontrada: {table_bill_id}")
+            branch_id = bill.branch_id
+            is_reprint = await self._repo.bill_has_receipt(tenant_id, table_bill_id)
+
         return await self._repo.create_receipt_print(
             ReceiptPrint(
                 tenant_id=tenant_id,
-                branch_id=order.branch_id,
+                branch_id=branch_id,
                 order_id=order_id,
+                table_bill_id=table_bill_id,
                 employee_id=employee_id,
                 is_reprint=is_reprint,
             )

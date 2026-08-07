@@ -30,6 +30,21 @@ class StoreBranch:
 
 
 @dataclass
+class StoreTable:
+    """La mesa detrás del QR de una calcomanía, tal y como el comensal la ve.
+
+    Lleva el número —que es lo que la persona reconoce— y no el código, que ya venía en la URL
+    y no le dice nada a nadie. La sede viaja con ella porque el pedido se abre contra esa sede y
+    no contra la que el cuerpo de la petición diga.
+    """
+
+    id: uuid.UUID
+    number: str
+    branch_id: uuid.UUID
+    branch_name: str
+
+
+@dataclass
 class StoreCategory:
     id: uuid.UUID
     name: str

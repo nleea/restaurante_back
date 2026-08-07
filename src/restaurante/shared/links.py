@@ -44,6 +44,32 @@ def order_edit_url(base_url: str, slug: str | None, edit_token: str) -> str:
     return f"{base}/my-order/{edit_token}" if base else ""
 
 
+def table_order_url(
+    base_url: str, slug: str | None, branch_code: str, table_code: str
+) -> str:
+    """La dirección que va codificada en el QR pegado a una mesa.
+
+    Vive aquí, con los demás enlaces públicos, por un motivo que no es de orden: esta URL se
+    IMPRIME. Un enlace de WhatsApp mal construido se corrige mandando otro; una calcomanía mal
+    construida hay que despegarla de diez mesas. Que exista un solo sitio donde se decide la
+    forma es lo que hace que el papel y el router no puedan discrepar.
+
+    Sede y mesa van las dos en el path porque el front las lee de ahí (`/store/:branchCode/
+    table/:tableCode`) y porque el backend público sólo acepta esa forma: el código de mesa es
+    único DENTRO de su sede, así que uno sin la otra no identifica nada.
+
+    Sin dominio configurado se devuelve cadena vacía, igual que los demás: media URL impresa en
+    una calcomanía es el peor resultado posible, porque no falla hasta que un cliente la escanea.
+    """
+    base = tenant_base_url(base_url, slug)
+    if not base:
+        return ""
+    return (
+        f"{base}/store/{quote(branch_code, safe='')}"
+        f"/table/{quote(table_code, safe='')}"
+    )
+
+
 def delivery_payment_url(base_url: str, slug: str | None, raw_token: str) -> str:
     """El enlace con el que un cliente paga SU domicilio ya cotizado.
 

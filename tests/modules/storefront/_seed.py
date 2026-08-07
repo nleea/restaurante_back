@@ -22,6 +22,7 @@ from restaurante.modules.menu.infrastructure.models import (
     ProductPriceModel,
     ProductVariantModel,
 )
+from restaurante.modules.orders.infrastructure.models import DiningTableModel
 from restaurante.modules.recipes.infrastructure.models import (
     IngredientModel,
     RecipeItemModel,
@@ -66,6 +67,35 @@ async def seed_primary_branch(
         await session.commit()
         await session.refresh(branch)
         return branch.id
+
+
+async def seed_dining_table(
+    branch_id: uuid.UUID,
+    *,
+    number: str = "5",
+    code: str = "M5CODE",
+    is_active: bool = True,
+) -> uuid.UUID:
+    """Una mesa con su código impreso ya fijado, para poder escanearla en el test.
+
+    El código se pasa a mano en vez de dejar que lo acuñe el repositorio: aquí interesa
+    direccionar una mesa CONOCIDA desde la URL, no ejercitar el generador (eso ya lo prueban
+    los tests de la comanda).
+    """
+    tenant_id = await demo_tenant_id()
+    async with SessionFactory() as session:
+        table = DiningTableModel(
+            tenant_id=tenant_id,
+            branch_id=branch_id,
+            number=number,
+            code=code,
+            capacity=4,
+            is_active=is_active,
+        )
+        session.add(table)
+        await session.commit()
+        await session.refresh(table)
+        return table.id
 
 
 async def seed_branch_price(

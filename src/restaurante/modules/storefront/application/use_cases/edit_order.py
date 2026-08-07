@@ -35,7 +35,7 @@ from restaurante.modules.storefront.domain.order_edit import (
     paid_line_change,
     total_invariant,
 )
-from restaurante.modules.storefront.domain.ports import StorefrontRepository
+from restaurante.modules.storefront.domain.ports import KitchenDispatch, StorefrontRepository
 from restaurante.shared.domain.audit import AuditEvent, AuditEventRecorder
 from restaurante.shared.domain.errors import NotFoundError, ValidationError
 
@@ -62,12 +62,6 @@ class OrderEditReader(Protocol):
     async def paid_total(
         self, tenant_id: uuid.UUID, order_id: uuid.UUID
     ) -> Decimal: ...
-
-
-class KitchenDispatch(Protocol):
-    """Enviar a cocina lo que se añadió. Opcional: sin él, no se enruta nada."""
-
-    async def route_order(self, tenant_id: uuid.UUID, order_id: uuid.UUID) -> None: ...
 
 
 @dataclass

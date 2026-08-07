@@ -29,11 +29,11 @@ The system SHALL scope every orders read and write to the `tenant_id` resolved b
 
 ### Requirement: Manage dining tables
 
-The system SHALL allow authorized users to create, list, update and deactivate dining tables for a branch. A table's `number` MUST be unique within its branch, and `capacity` MUST be greater than zero.
+The system SHALL allow authorized users to create, list, update and deactivate dining tables for a branch. A table's `number` MUST be unique within its branch, and `capacity` MUST be greater than zero. Creating a table SHALL also mint its public `code`, unique within the branch and stable across renumbering, and reads SHALL return it.
 
 #### Scenario: Create a table
 - **WHEN** an authorized user creates a table with a number unique in the branch and a positive capacity
-- **THEN** the table is persisted with status `free` and returned
+- **THEN** the table is persisted with status `free` and a generated public `code`, and returned
 
 #### Scenario: Reject duplicate table number in a branch
 - **WHEN** a user creates a table whose number already exists in that branch
@@ -41,7 +41,7 @@ The system SHALL allow authorized users to create, list, update and deactivate d
 
 #### Scenario: List tables for a branch
 - **WHEN** an authorized user lists tables for a branch of the current tenant
-- **THEN** only that branch's tables are returned
+- **THEN** only that branch's tables are returned, each with its public code
 
 ### Requirement: Open an order
 
@@ -123,11 +123,14 @@ The system SHALL keep an order's `subtotal` equal to the sum of its item line su
 
 ### Requirement: Cancel orders and items
 
-The system SHALL allow authorized users to cancel an `open` order or a single item, recording a cancellation audit entry with a reason, the requesting employee, and whether authorization was required. Cancelling a whole order SHALL set its status to `cancelled`, free any associated table, and release its delivery when that delivery never left the store.
+The system SHALL allow authorized users to cancel an `open` order or a single item, recording a cancellation audit entry with a reason, the requesting employee, and whether authorization was required. Cancelling a whole order SHALL set its status to `cancelled`, free the associated table **only when no other order on that table is still open**, and release its delivery when that delivery never left the store.
 
 Releasing the delivery is the same obligation as freeing the table: the order stops existing, so
 everything it was holding has to be let go. A delivery left behind can never reach the kitchen —
 its order is gone — and it blocks its shift's cash session with no honest way out.
+
+The table is the exception to "let everything go", and for the same reason as on close: what the
+cancelled order was holding may still be held by somebody else's order on the same table.
 
 A delivery that is already `assigned` or `in_transit` SHALL NOT be released by the cancellation.
 Someone left with that food, and the outcome belongs to them: it is still resolved by marking it
@@ -140,8 +143,15 @@ not delivered, with a reason.
 
 #### Scenario: Cancel a whole order
 - **WHEN** an authorized user cancels an open order with a reason
-- **THEN** a cancellation record is created
-- **AND** the order status becomes `cancelled` and any associated table becomes `free`
+- **THEN** a cancellation record is created and the order status becomes `cancelled`
+
+#### Scenario: Cancelling the last open order frees the table
+- **WHEN** the cancelled order was the only order still open on its table
+- **THEN** that table becomes `free`
+
+#### Scenario: Cancelling one diner's order leaves the table occupied
+- **WHEN** an order is cancelled while another order on the same table is still `open`
+- **THEN** the table remains `occupied`
 
 #### Scenario: Cancelling releases a delivery that never left
 - **WHEN** an authorized user cancels an open order whose delivery is still `pending`
@@ -185,15 +195,27 @@ The system SHALL allow authorized users to close an `open` order only when it is
 settled: the sum of the order's payments MUST be greater than or equal to the
 order `total`, UNLESS the order has a registered customer, in which case the
 unpaid remainder MAY be closed on credit. On close the system stamps `closed_at`,
-sets status `closed`, and frees any associated dining table. Cash overpayment
-(payments summing above `total`) is permitted and treated as change. When the
-order is underpaid and has no registered customer, the system SHALL reject the
+sets status `closed`, and frees the associated dining table **only when no other order on that
+table is still open**. Cash overpayment (payments summing above `total`) is permitted and treated
+as change. When the order is underpaid and has no registered customer, the system SHALL reject the
 close and leave the order `open`.
+
+Freeing the table unconditionally was correct while a table could hold one order. It stops being
+correct the moment several diners each hold their own order on the same table: the first person to
+pay would mark table 5 free with three people still eating at it, and the floor would offer it to
+whoever walked in. A table is held by the food on it, not by whoever settles first.
 
 #### Scenario: Close a fully paid order
 - **WHEN** an authorized user closes an open order whose payments sum to at least its `total`
 - **THEN** the order status becomes `closed` with `closed_at` set
-- **AND** any associated table becomes `free`
+
+#### Scenario: The last open order frees the table
+- **WHEN** the closed order was the only order still open on its table
+- **THEN** that table becomes `free`
+
+#### Scenario: A table with diners still eating stays occupied
+- **WHEN** an order closes while another order on the same table is still `open`
+- **THEN** the table remains `occupied`
 
 #### Scenario: Overpayment is allowed as change
 - **WHEN** an open order's cash payments sum to more than its `total`
@@ -555,4 +577,23 @@ The system SHALL permit a delivery order to exist with no payment-method intent 
 
 - **WHEN** a public customer submits products and a delivery location
 - **THEN** the order is created without a payment method and is marked pending quote rather than requiring a provisional payment choice
+
+### Requirement: Orders carry their diner and their origin
+
+An order SHALL accept and return `diner_name` (optional) and `origin` (`staff`, `web` or `qr`,
+defaulting to `staff`). Both are set at creation and are not editable afterwards: they describe how
+the order came into being, and rewriting that later would make the floor and the reports lie about
+the past.
+
+#### Scenario: Open an order with a diner name and origin
+- **WHEN** an order is opened with a diner name and an origin
+- **THEN** both are persisted and returned on subsequent reads
+
+#### Scenario: Defaults hold when neither is given
+- **WHEN** an authorized employee opens an order without either field
+- **THEN** `diner_name` is null and `origin` is `staff`
+
+#### Scenario: Reject an unknown origin
+- **WHEN** an order is opened with an origin outside the allowed set
+- **THEN** the system responds with a validation error
 

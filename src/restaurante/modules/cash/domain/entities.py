@@ -38,5 +38,10 @@ class CashMovement:
     method: str
     id: uuid.UUID | None = None
     reference_id: uuid.UUID | None = None
+    # La cuenta de mesa que produjo este movimiento, cuando la hubo. NO es una columna: se
+    # deriva del pedido al que apunta `reference_id`. Existe para que el feed del cajero pueda
+    # decir que tres líneas fueron UN solo cobro — cobrar la mesa 5 con un billete deja un
+    # movimiento por comanda, y sin esto el cajero ve tres cobros donde hizo uno.
+    table_bill_id: uuid.UUID | None = None
     category: str = "other"
     created_at: datetime | None = None
