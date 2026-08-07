@@ -11,6 +11,7 @@ Resulting credentials:
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 
 from sqlalchemy import func, select
@@ -109,16 +110,30 @@ async def seed_rbac(session: AsyncSession) -> dict[str, RoleModel]:
     return roles
 
 
-async def seed() -> None:
+def admin_email_for(slug: str) -> str:
+    """`demo` → `admin@demo.com`. El correo es único POR TENANT (uq_users_tenant_email),
+    así que derivarlo del slug no colisiona; sólo evita que dos negocios compartan
+    literalmente la misma casilla."""
+    return f"admin@{slug}.com"
+
+
+async def seed(
+    slug: str = DEMO_SLUG,
+    tenant_name: str = "Demo Restaurant",
+    branch_code: str = DEMO_BRANCH_CODE,
+    email: str | None = None,
+    password: str = DEMO_PASSWORD,
+) -> None:
+    email = email or admin_email_for(slug)
     hasher = Argon2PasswordHasher()
     async with SessionFactory() as session:
         tenant = (
             await session.execute(
-                select(TenantModel).where(TenantModel.slug == DEMO_SLUG)
+                select(TenantModel).where(TenantModel.slug == slug)
             )
         ).scalar_one_or_none()
         if tenant is None:
-            tenant = TenantModel(slug=DEMO_SLUG, name="Demo Restaurant", is_active=True)
+            tenant = TenantModel(slug=slug, name=tenant_name, is_active=True)
             session.add(tenant)
             await session.flush()
             print(f"Tenant created: {tenant.slug} ({tenant.id})")
@@ -132,7 +147,7 @@ async def seed() -> None:
             await session.execute(
                 select(BranchModel).where(
                     BranchModel.tenant_id == tenant.id,
-                    func.lower(BranchModel.code) == DEMO_BRANCH_CODE.lower(),
+                    func.lower(BranchModel.code) == branch_code.lower(),
                 )
             )
         ).scalars().first()
@@ -140,14 +155,14 @@ async def seed() -> None:
             session.add(
                 BranchModel(
                     tenant_id=tenant.id,
-                    code=validate_branch_code(DEMO_BRANCH_CODE),
+                    code=validate_branch_code(branch_code),
                     name="Main Branch",
                     is_active=True,
                 )
             )
-            print(f"Branch created: {DEMO_BRANCH_CODE}")
+            print(f"Branch created: {branch_code}")
         else:
-            print(f"Branch already exists: {DEMO_BRANCH_CODE}")
+            print(f"Branch already exists: {branch_code}")
 
         roles = await seed_rbac(session)
         print(f"RBAC seeded: {len(PERMISSIONS)} permissions, {len(roles)} base roles")
@@ -156,23 +171,23 @@ async def seed() -> None:
             await session.execute(
                 select(UserModel).where(
                     UserModel.tenant_id == tenant.id,
-                    UserModel.email == DEMO_EMAIL,
+                    UserModel.email == email,
                 )
             )
         ).scalar_one_or_none()
         if user is None:
             user = UserModel(
                 tenant_id=tenant.id,
-                email=DEMO_EMAIL,
-                hashed_password=hasher.hash(DEMO_PASSWORD),
-                name="Demo Administrator",
+                email=email,
+                hashed_password=hasher.hash(password),
+                name=f"{tenant_name} Administrator",
                 is_active=True,
             )
             session.add(user)
             await session.flush()
-            print(f"User created: {DEMO_EMAIL} / {DEMO_PASSWORD}")
+            print(f"User created: {email} / {password}")
         else:
-            print(f"User already exists: {DEMO_EMAIL}")
+            print(f"User already exists: {email}")
 
         admin_role = roles[ADMIN_ROLE_NAME]
         already_admin = (
@@ -190,10 +205,31 @@ async def seed() -> None:
                     tenant_id=tenant.id, user_id=user.id, role_id=admin_role.id
                 )
             )
-            print(f"Assigned '{ADMIN_ROLE_NAME}' role to {DEMO_EMAIL}")
+            print(f"Assigned '{ADMIN_ROLE_NAME}' role to {email}")
 
         await session.commit()
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--slug", default=DEMO_SLUG, help="subdominio del tenant")
+    parser.add_argument("--name", default=None, help="nombre visible del negocio")
+    parser.add_argument("--branch", default=DEMO_BRANCH_CODE, help="código de la sede")
+    parser.add_argument(
+        "--email", default=None, help="correo del admin (por defecto admin@<slug>.com)"
+    )
+    parser.add_argument("--password", default=DEMO_PASSWORD)
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    asyncio.run(seed())
+    args = _parse_args()
+    asyncio.run(
+        seed(
+            slug=args.slug,
+            tenant_name=args.name or f"{args.slug.title()} Restaurant",
+            branch_code=args.branch,
+            email=args.email,
+            password=args.password,
+        )
+    )
