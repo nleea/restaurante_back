@@ -34,6 +34,7 @@ Login (from the baseline seed):
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 from collections import Counter
 from datetime import UTC, date, datetime, time, timedelta
@@ -117,7 +118,13 @@ from restaurante.shared.config import get_settings
 from restaurante.shared.database import SessionFactory
 from restaurante.shared.security.password import Argon2PasswordHasher
 from restaurante.shared.tenancy.models import BranchModel, TenantModel
-from scripts.seed import DEMO_BRANCH_CODE, DEMO_EMAIL, DEMO_PASSWORD, DEMO_SLUG
+from scripts.seed import (
+    DEMO_BRANCH_CODE,
+    DEMO_EMAIL,
+    DEMO_PASSWORD,
+    DEMO_SLUG,
+    admin_email_for,
+)
 from scripts.seed import seed as seed_baseline
 
 # --- status / value constants (plain strings: no DB enum) ---------------------
@@ -219,17 +226,29 @@ async def seed_staff(
     staff_role_id: Any,
     city_id: Any,
     courier_role_id: Any = None,
+    email_domain: str = "demo.com",
+    doc_prefix: str = "CC",
 ) -> dict[str, EmployeeModel]:
     hasher = Argon2PasswordHasher()
+    # El dominio sale del slug: los correos son únicos POR TENANT, así que no
+    # colisionarían, pero un `carlos@demo.com` dentro del tenant `pase` confunde
+    # a cualquiera que lo lea en el panel.
+    #
+    # El documento es otra historia y NO es cosmético: `persons.document_number` es
+    # único GLOBALMENTE (la tabla de personas es compartida, no está por tenant) y
+    # `ix_employees_person_id` es único sobre `person_id` a secas. Con el mismo
+    # documento, sembrar un segundo negocio encuentra la persona y el empleado del
+    # primero y le reasigna la sede (más abajo) — es decir, le rompe el tenant al
+    # vecino. Por eso el prefijo cambia con el tenant.
     specs = [
-        ("Carlos", "Mendoza", "carlos@demo.com", "CC1001", "cashier"),
-        ("Luisa", "Fernández", "luisa@demo.com", "CC1005", "cashier2"),
-        ("Camilo", "Brito", "camilo@demo.com", "CC1004", "cook"),
-        ("Yeimi", "Epieyú", "yeimi@demo.com", "CC1006", "cook2"),
-        ("Diego", "Iguarán", "diego@demo.com", "CC1002", "driver1"),
-        ("Daniela", "Pushaina", "daniela@demo.com", "CC1003", "driver2"),
-        ("Andrés", "Uriana", "andres@demo.com", "CC1007", "driver3"),
-        ("Sofía", "Gámez", "sofia@demo.com", "CC1008", "waiter"),
+        ("Carlos", "Mendoza", f"carlos@{email_domain}", f"{doc_prefix}1001", "cashier"),
+        ("Luisa", "Fernández", f"luisa@{email_domain}", f"{doc_prefix}1005", "cashier2"),
+        ("Camilo", "Brito", f"camilo@{email_domain}", f"{doc_prefix}1004", "cook"),
+        ("Yeimi", "Epieyú", f"yeimi@{email_domain}", f"{doc_prefix}1006", "cook2"),
+        ("Diego", "Iguarán", f"diego@{email_domain}", f"{doc_prefix}1002", "driver1"),
+        ("Daniela", "Pushaina", f"daniela@{email_domain}", f"{doc_prefix}1003", "driver2"),
+        ("Andrés", "Uriana", f"andres@{email_domain}", f"{doc_prefix}1007", "driver3"),
+        ("Sofía", "Gámez", f"sofia@{email_domain}", f"{doc_prefix}1008", "waiter"),
     ]
     employees: dict[str, EmployeeModel] = {}
     for first, last, email, doc, key in specs:
@@ -1180,18 +1199,22 @@ async def seed_customers(
     session: AsyncSession,
     tenant_id: Any,
     city_id: Any,
+    doc_prefix: str = "CC",
 ) -> list[CustomerModel]:
+    # Mismo motivo que en seed_staff: `persons.document_number` es único global e
+    # `ix_customers_person_id` lo es sobre `person_id`. Compartir documento entre
+    # negocios significa compartir el cliente, no duplicarlo.
     specs = [
-        ("María", "González", "CC2001", "3001112233"),
-        ("Juan", "Pérez", "CC2002", "3002223344"),
-        ("Ana", "Ramírez", "CC2003", "3003334455"),
-        ("Luis", "Ojeda", "CC2004", "3004445566"),
-        ("Carmen", "Freyle", "CC2005", "3005556677"),
-        ("Rafael", "Ipuana", "CC2006", "3006667788"),
-        ("Paola", "Barros", "CC2007", "3007778899"),
-        ("Jorge", "Cotes", "CC2008", "3008889900"),
-        ("Milena", "Arpushana", "CC2009", "3009990011"),
-        ("Edgar", "Solano", "CC2010", "3010001122"),
+        ("María", "González", f"{doc_prefix}2001", "3001112233"),
+        ("Juan", "Pérez", f"{doc_prefix}2002", "3002223344"),
+        ("Ana", "Ramírez", f"{doc_prefix}2003", "3003334455"),
+        ("Luis", "Ojeda", f"{doc_prefix}2004", "3004445566"),
+        ("Carmen", "Freyle", f"{doc_prefix}2005", "3005556677"),
+        ("Rafael", "Ipuana", f"{doc_prefix}2006", "3006667788"),
+        ("Paola", "Barros", f"{doc_prefix}2007", "3007778899"),
+        ("Jorge", "Cotes", f"{doc_prefix}2008", "3008889900"),
+        ("Milena", "Arpushana", f"{doc_prefix}2009", "3009990011"),
+        ("Edgar", "Solano", f"{doc_prefix}2010", "3010001122"),
     ]
     customers: list[CustomerModel] = []
     for first, last, doc, phone in specs:
@@ -2004,9 +2027,9 @@ async def seed_finance(
 # El codigo de la sede y el dominio salen de la BASE y de la configuracion, no de estas
 # constantes: `branches.code` se edita desde el panel, y una guia que diga "/store/main"
 # cuando la sede se llama "MAIN" manda al 404 a quien la sigue.
-def walkthrough(branch_code: str) -> str:
+def walkthrough(branch_code: str, slug: str = DEMO_SLUG, admin: str = DEMO_EMAIL) -> str:
     base_domain = get_settings().base_domain
-    host = f"{DEMO_SLUG}.localhost:5173"
+    host = f"{slug}.localhost:5173"
     warning = ""
     if base_domain != "localhost":
         warning = (
@@ -2034,18 +2057,24 @@ Recorrido de «mi pedido» (pnpm dev en front/, uvicorn en backend/):
                 entrega aun en el pase, anadir TODAVIA se puede. Pasala a "en camino" en
                 /dispatch y la vista entera se apaga.
 
-  Admin: {DEMO_EMAIL} / {DEMO_PASSWORD}
+  Admin: {admin} / {DEMO_PASSWORD}
 """
 
 
 # --- orchestrator -------------------------------------------------------------
-async def seed_demo() -> None:
+async def seed_demo(slug: str = DEMO_SLUG, tenant_name: str | None = None) -> None:
+    tenant_name = tenant_name or f"{slug.title()} Restaurant"
+    admin = admin_email_for(slug)
+    # El dominio de los correos del personal se deriva del slug, igual que el del admin.
+    email_domain = admin.split("@", 1)[1]
+    # "CC" para demo (no cambia lo ya sembrado); un prefijo propio para el resto.
+    doc_prefix = "CC" if slug == DEMO_SLUG else slug[:6].upper()
     # 1. Guarantee the baseline (tenant/branch/admin/RBAC) exists and is committed.
-    await seed_baseline()
+    await seed_baseline(slug=slug, tenant_name=tenant_name)
 
     async with SessionFactory() as session:
         tenant = (
-            await session.execute(select(TenantModel).where(TenantModel.slug == DEMO_SLUG))
+            await session.execute(select(TenantModel).where(TenantModel.slug == slug))
         ).scalar_one()
         branch = (
             await session.execute(
@@ -2055,7 +2084,7 @@ async def seed_demo() -> None:
                 )
             )
         ).scalars().first()
-        assert branch is not None, "la sede demo tiene que existir tras el baseline"
+        assert branch is not None, f"la sede de {slug} tiene que existir tras el baseline"
 
         roles = (
             (await session.execute(select(RoleModel).where(RoleModel.is_global.is_(True))))
@@ -2071,7 +2100,14 @@ async def seed_demo() -> None:
         units = await seed_units(session)
         city = await seed_geo(session)
         employees = await seed_staff(
-            session, tenant.id, branch.id, staff_role.id, city.id, courier_role.id
+            session,
+            tenant.id,
+            branch.id,
+            staff_role.id,
+            city.id,
+            courier_role.id,
+            email_domain,
+            doc_prefix,
         )
         await seed_shift_templates(session, tenant.id, branch.id, employees)
         cashier = employees["cashier"]
@@ -2094,7 +2130,7 @@ async def seed_demo() -> None:
         )
 
         await seed_business_profile(session, tenant.id, branch)
-        customers = await seed_customers(session, tenant.id, city.id)
+        customers = await seed_customers(session, tenant.id, city.id, doc_prefix)
         await seed_delivery_settings(session, tenant.id, branch.id)
         routes = await seed_delivery_routes(session, tenant.id, branch.id, employees)
         tables = await seed_dining_tables(session, tenant.id, branch.id)
@@ -2127,8 +2163,12 @@ async def seed_demo() -> None:
             print(f"  {table:<24} {counts[table]}")
     else:
         print("Demo dataset already present: nothing to create.")
-    print(walkthrough(branch_code))
+    print(walkthrough(branch_code, slug, admin))
 
 
 if __name__ == "__main__":
-    asyncio.run(seed_demo())
+    parser = argparse.ArgumentParser(description="Carga el dataset demo en un tenant.")
+    parser.add_argument("--slug", default=DEMO_SLUG, help="subdominio del tenant")
+    parser.add_argument("--name", default=None, help="nombre visible del negocio")
+    args = parser.parse_args()
+    asyncio.run(seed_demo(slug=args.slug, tenant_name=args.name))
