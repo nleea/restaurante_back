@@ -8,8 +8,10 @@ atomically by the repository.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from decimal import Decimal
+from typing import Protocol
 
 from restaurante.modules.inventory.domain.entities import (
     InventoryMovement,
@@ -22,14 +24,41 @@ from restaurante.shared.domain.errors import (
     ValidationError,
 )
 
+logger = logging.getLogger(__name__)
+
+# La clave de la regla, repetida aquí como texto en vez de importada del módulo de alertas:
+# inventario no conoce alertas, y no debe. Si la clave cambiara, el anuncio dejaría de
+# encontrar regla y el barrido seguiría cubriendo el caso — que es exactamente el fallo
+# tolerable que este diseño elige.
+ALERT_RULE_LOW_STOCK = "low_stock"
+
+
+class StockAlertAnnouncer(Protocol):
+    """Lo mínimo que inventario necesita saber de las alertas: cómo pedir una mirada."""
+
+    async def announce(
+        self,
+        tenant_id: uuid.UUID,
+        branch_id: uuid.UUID,
+        rule_key: str,
+        subject_ref: str,
+    ) -> None: ...
+
+
 MOVEMENT_IN = "in"
 MOVEMENT_OUT = "out"
 MOVEMENT_ADJUSTMENT = "adjustment"
 
 
 class InventoryService:
-    def __init__(self, repo: InventoryRepository) -> None:
+    def __init__(
+        self, repo: InventoryRepository, alerts: StockAlertAnnouncer | None = None
+    ) -> None:
         self._repo = repo
+        # Opcional a propósito. Es el ACELERADOR de las alertas, no su registro: el barrido
+        # del worker encuentra el stock bajo con o sin esto. Inventario no puede depender de
+        # que haya una cola levantada para poder registrar una salida.
+        self._alerts = alerts
 
     # --- internal guards ---------------------------------------------------
     async def _require_branch(
@@ -134,7 +163,30 @@ class InventoryService:
             reference_id=reference_id,
             notes=notes,
         )
-        return await self._repo.apply_movement(movement, delta)
+        applied = await self._repo.apply_movement(movement, delta)
+        await self._announce(tenant_id, branch_id, ingredient_id)
+        return applied
+
+    async def _announce(
+        self,
+        tenant_id: uuid.UUID,
+        branch_id: uuid.UUID,
+        ingredient_id: uuid.UUID,
+    ) -> None:
+        """Pide mirar este insumo ya. Nunca falla el movimiento que lo disparó.
+
+        El anunciante ya se traga sus propios errores; este `try` es el cinturón sobre los
+        tirantes: que una alerta no salga jamás puede impedir que se registre una salida de
+        inventario.
+        """
+        if self._alerts is None:
+            return
+        try:
+            await self._alerts.announce(
+                tenant_id, branch_id, ALERT_RULE_LOW_STOCK, str(ingredient_id)
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("No se pudo anunciar el insumo para alertas", exc_info=True)
 
     async def recount(
         self,
@@ -166,7 +218,11 @@ class InventoryService:
             employee_id=employee_id,
             notes=notes,
         )
-        return await self._repo.apply_movement(movement, delta)
+        applied = await self._repo.apply_movement(movement, delta)
+        # Un recuento también cambia el nivel, así que también merece una mirada: es
+        # justamente cuando se descubre que faltaba más de lo que decía el sistema.
+        await self._announce(tenant_id, branch_id, ingredient_id)
+        return applied
 
     async def list_movements(
         self, tenant_id: uuid.UUID, branch_id: uuid.UUID, ingredient_id: uuid.UUID

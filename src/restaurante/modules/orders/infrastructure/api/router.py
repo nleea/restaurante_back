@@ -8,42 +8,83 @@ orders (items, addons, discount, close, receipts) `orders.update`; cancellations
 from __future__ import annotations
 
 import uuid
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, Response, status
+from fastapi.responses import StreamingResponse
 
 from restaurante.modules.identity.infrastructure.api.deps import require_permission
+from restaurante.modules.orders.domain.bill_allocation import BillPayment
 from restaurante.modules.orders.infrastructure.api.deps import (
+    EventStreamDep,
     OrderServiceDep,
     PaymentServiceDep,
     TenantDep,
 )
 from restaurante.modules.orders.infrastructure.api.schemas import (
     AddItemRequest,
+    AssignCustomerRequest,
     AttachAddonRequest,
+    BillReceiptLine,
+    BillReceiptMember,
+    BillReceiptResponse,
+    CancelRefundRequest,
     CancelRequest,
+    ChargeTableBillRequest,
+    ConfirmRefundRequest,
     CreateDiningTableRequest,
     DiningTableResponse,
     OpenOrderRequest,
+    OpenTableBillRequest,
     OrderItemAddonResponse,
     OrderItemResponse,
     OrderPaymentResponse,
     OrderResponse,
+    PaymentClaimResponse,
     ReceiptPrintResponse,
+    RecordBillReceiptRequest,
     RecordReceiptRequest,
+    RefundResponse,
     RegisterPaymentRequest,
+    RejectPaymentClaimRequest,
     SetDiscountRequest,
+    SetItemNotesRequest,
+    TableBillMemberResponse,
+    TableBillResponse,
+    TableQrResponse,
     UpdateDiningTableRequest,
     UpdateItemQuantityRequest,
+    VerifyPaymentRequest,
 )
+from restaurante.shared.domain.order_label import order_label
+from restaurante.shared.realtime.deps import event_stream_response
 
 router = APIRouter(prefix="/orders", tags=["orders"])
+# Propio prefijo: una devolución pertenece a la sucursal y al turno, no a la ruta de un
+# pedido — el cajero las lista todas juntas, no pedido por pedido.
+refunds_router = APIRouter(prefix="/refunds", tags=["orders"])
 
 _READ = Depends(require_permission("orders.read"))
 _CREATE = Depends(require_permission("orders.create"))
 _UPDATE = Depends(require_permission("orders.update"))
 _CANCEL = Depends(require_permission("orders.cancel"))
 _PAY = Depends(require_permission("orders.pay"))
+_FINANCE = Depends(require_permission("finance.manage"))
 _NO_CONTENT = status.HTTP_204_NO_CONTENT
+
+
+# --- Live board (SSE) ---------------------------------------------------------
+@router.get("/events", dependencies=[_READ])
+async def stream_events(
+    branch_id: uuid.UUID, stream: EventStreamDep, tenant_id: TenantDep
+) -> StreamingResponse:
+    """Server-sent events with the branch's Salón changes (heartbeat every ~15 s).
+
+    Orders (created/updated/items/closed/cancelled) and dining-table status changes all
+    announce here. Degrades to heartbeats-only when the broker is down, so clients keep the
+    connection and fall back to polling for data freshness.
+    """
+    return event_stream_response(stream, "orders", tenant_id, branch_id)
 
 
 # --- Dining tables ----------------------------------------------------------
@@ -69,6 +110,26 @@ async def list_tables(
     return [DiningTableResponse.model_validate(t, from_attributes=True) for t in tables]
 
 
+@router.get(
+    "/tables/{table_id}/qr", response_model=TableQrResponse, dependencies=[_READ]
+)
+async def get_table_qr(
+    table_id: uuid.UUID, service: OrderServiceDep, tenant_id: TenantDep
+) -> TableQrResponse:
+    """El QR de esa mesa, listo para imprimir y pegar.
+
+    Devuelve el SVG y TAMBIÉN la URL que codifica. Un QR es opaco: si la única forma de saber a
+    dónde apunta fuera escanearlo, nadie comprobaría nada antes de imprimir diez calcomanías.
+
+    Gated por `orders.read` y no por un permiso nuevo: el código de la mesa no es un secreto —va
+    impreso a la vista de cualquiera que entre al local— así que lo que protege este endpoint no
+    es el dato, es el acceso al panel. Un permiso nuevo exigiría además sembrarlo, y sin
+    `scripts.seed` daría 403 a todo el mundo.
+    """
+    url, svg = await service.table_qr(tenant_id, table_id)
+    return TableQrResponse(url=url, svg=svg)
+
+
 @router.patch(
     "/tables/{table_id}", response_model=DiningTableResponse, dependencies=[_UPDATE]
 )
@@ -82,6 +143,153 @@ async def update_table(
         tenant_id, table_id, payload.model_dump(exclude_unset=True)
     )
     return DiningTableResponse.model_validate(table, from_attributes=True)
+
+
+# --- Table bills ------------------------------------------------------------
+# Sin permiso nuevo: cobrar una mesa es la MISMA autoridad que cobrar una comanda, ejercida
+# sobre varias a la vez. Un código nuevo habría que sembrarlo además, y sin `scripts.seed`
+# daría 403 a todo el mundo.
+async def _bill_response(
+    service: OrderServiceDep, tenant_id: uuid.UUID, bill_id: uuid.UUID
+) -> TableBillResponse:
+    bill, members, outstanding = await service.get_table_bill(tenant_id, bill_id)
+    assert bill.id is not None
+    rows = []
+    for member in members:
+        assert member.id is not None
+        paid = await service.paid_total(tenant_id, member.id)
+        rows.append(
+            TableBillMemberResponse(
+                order_id=member.id,
+                order_label=order_label(member.id),
+                diner_name=member.diner_name,
+                total=member.total,
+                paid=paid,
+                outstanding=max(member.total - paid, Decimal(0)),
+            )
+        )
+    return TableBillResponse(
+        id=bill.id,
+        branch_id=bill.branch_id,
+        dining_table_id=bill.dining_table_id,
+        status=bill.status,
+        total=bill.total,
+        members=rows,
+        outstanding=outstanding,
+        closed_at=bill.closed_at,
+    )
+
+
+@router.post(
+    "/table-bills", response_model=TableBillResponse, status_code=201, dependencies=[_UPDATE]
+)
+async def open_table_bill(
+    payload: OpenTableBillRequest, service: OrderServiceDep, tenant_id: TenantDep
+) -> TableBillResponse:
+    """Agrupa las comandas abiertas de una mesa para cobrarlas en un gesto.
+
+    Sin `order_ids` toma todas: casi todas las mesas pagan juntas.
+    """
+    bill, _ = await service.open_table_bill(
+        tenant_id, payload.dining_table_id, payload.employee_id, payload.order_ids
+    )
+    assert bill.id is not None
+    return await _bill_response(service, tenant_id, bill.id)
+
+
+@router.get(
+    "/table-bills/{bill_id}", response_model=TableBillResponse, dependencies=[_READ]
+)
+async def get_table_bill(
+    bill_id: uuid.UUID, service: OrderServiceDep, tenant_id: TenantDep
+) -> TableBillResponse:
+    return await _bill_response(service, tenant_id, bill_id)
+
+
+@router.get(
+    "/table-bills/{bill_id}/receipt",
+    response_model=BillReceiptResponse,
+    dependencies=[_READ],
+)
+async def get_bill_receipt(
+    bill_id: uuid.UUID, service: OrderServiceDep, tenant_id: TenantDep
+) -> BillReceiptResponse:
+    """Los datos de la tirilla, ya juntos. Leer no imprime: registrar la impresión es otro POST."""
+    data = await service.bill_receipt(tenant_id, bill_id)
+    bill = data["bill"]
+    return BillReceiptResponse(
+        bill_id=bill.id,
+        business_name=data["business_name"],
+        tax_id=data["tax_id"],
+        business_address=data["business_address"],
+        branch_name=data["branch_name"],
+        table_number=data["table_number"],
+        total=sum((m["total"] for m in data["members"]), Decimal(0)),
+        methods=data["methods"],
+        members=[
+            BillReceiptMember(
+                order_id=m["order_id"],
+                order_label=order_label(m["order_id"]),
+                diner_name=m["diner_name"],
+                total=m["total"],
+                lines=[BillReceiptLine(**line) for line in m["lines"]],
+            )
+            for m in data["members"]
+        ],
+        closed_at=bill.closed_at,
+    )
+
+
+@router.delete("/table-bills/{bill_id}", status_code=_NO_CONTENT, dependencies=[_UPDATE])
+async def dissolve_table_bill(
+    bill_id: uuid.UUID, service: OrderServiceDep, tenant_id: TenantDep
+) -> Response:
+    """Deshace la agrupación. Los miembros salen intactos: no se cobró ni se cerró nada."""
+    await service.dissolve_table_bill(tenant_id, bill_id)
+    return Response(status_code=_NO_CONTENT)
+
+
+@router.post(
+    "/table-bills/{bill_id}/payments",
+    response_model=TableBillResponse,
+    dependencies=[_PAY],
+)
+async def charge_table_bill(
+    bill_id: uuid.UUID,
+    payload: ChargeTableBillRequest,
+    service: OrderServiceDep,
+    tenant_id: TenantDep,
+) -> TableBillResponse:
+    """Cobra la cuenta. Si cubre, cierra a todos sus miembros en la MISMA transacción.
+
+    Un cobro parcial es legítimo —el cajero recibe lo que le den— y deja la cuenta abierta con
+    lo cobrado ya registrado. Lo que no hace es cerrar nada a medias.
+    """
+    await service.charge_table_bill(
+        tenant_id,
+        bill_id,
+        [BillPayment(amount=p.amount, method=p.method) for p in payload.payments],
+        payload.employee_id,
+    )
+    return await _bill_response(service, tenant_id, bill_id)
+
+
+@router.post(
+    "/table-bills/{bill_id}/receipts",
+    response_model=ReceiptPrintResponse,
+    status_code=201,
+    dependencies=[_UPDATE],
+)
+async def record_bill_receipt(
+    bill_id: uuid.UUID,
+    payload: RecordBillReceiptRequest,
+    service: OrderServiceDep,
+    tenant_id: TenantDep,
+) -> ReceiptPrintResponse:
+    receipt = await service.record_receipt_print(
+        tenant_id, payload.employee_id, table_bill_id=bill_id
+    )
+    return ReceiptPrintResponse.model_validate(receipt, from_attributes=True)
 
 
 # --- Orders -----------------------------------------------------------------
@@ -108,12 +316,15 @@ async def list_orders(
     branch_id: uuid.UUID | None = None,
     status_filter: str | None = None,
     dining_table_id: uuid.UUID | None = None,
+    open_session_only: bool = False,
 ) -> list[OrderResponse]:
+    # `open_session_only=true` is the live salón scope: only the branch's open cash session.
     orders = await service.list_orders(
         tenant_id,
         branch_id=branch_id,
         status=status_filter,
         dining_table_id=dining_table_id,
+        open_session_only=open_session_only,
     )
     return [OrderResponse.model_validate(o, from_attributes=True) for o in orders]
 
@@ -177,6 +388,18 @@ async def set_discount(
     return OrderResponse.model_validate(order, from_attributes=True)
 
 
+@router.post("/{order_id}/customer", response_model=OrderResponse, dependencies=[_UPDATE])
+async def assign_customer(
+    order_id: uuid.UUID,
+    payload: AssignCustomerRequest,
+    service: OrderServiceDep,
+    tenant_id: TenantDep,
+) -> OrderResponse:
+    """Attach a registered customer to an open order (enables fiado at close)."""
+    order = await service.assign_customer(tenant_id, order_id, payload.customer_id)
+    return OrderResponse.model_validate(order, from_attributes=True)
+
+
 @router.post(
     "/{order_id}/receipts",
     response_model=ReceiptPrintResponse,
@@ -190,7 +413,7 @@ async def record_receipt(
     tenant_id: TenantDep,
 ) -> ReceiptPrintResponse:
     receipt = await service.record_receipt_print(
-        tenant_id, order_id, payload.employee_id
+        tenant_id, payload.employee_id, order_id=order_id
     )
     return ReceiptPrintResponse.model_validate(receipt, from_attributes=True)
 
@@ -217,6 +440,117 @@ async def register_payment(
         payload.diner_reference,
     )
     return OrderPaymentResponse.model_validate(payment, from_attributes=True)
+
+
+# --- Devoluciones -----------------------------------------------------------
+@refunds_router.get("", response_model=list[RefundResponse], dependencies=[_FINANCE])
+async def list_refunds(
+    branch_id: uuid.UUID,
+    service: PaymentServiceDep,
+    tenant_id: TenantDep,
+    status_filter: str | None = "pending",
+) -> list[RefundResponse]:
+    refunds = await service.list_refunds(tenant_id, branch_id, status=status_filter)
+    return [RefundResponse.model_validate(r, from_attributes=True) for r in refunds]
+
+
+@refunds_router.post(
+    "/{refund_id}/confirm", response_model=RefundResponse, dependencies=[_FINANCE]
+)
+async def confirm_refund(
+    refund_id: uuid.UUID,
+    payload: ConfirmRefundRequest,
+    service: PaymentServiceDep,
+    tenant_id: TenantDep,
+) -> RefundResponse:
+    """La plata se devolvió: registra la salida de caja con el método original.
+
+    Requiere `finance.manage`: autorizar una devolución es una decisión de plata, no una
+    operación de caja.
+    """
+    refund = await service.confirm_refund(tenant_id, refund_id, payload.employee_id)
+    return RefundResponse.model_validate(refund, from_attributes=True)
+
+
+@refunds_router.post(
+    "/{refund_id}/cancel", response_model=RefundResponse, dependencies=[_FINANCE]
+)
+async def cancel_refund(
+    refund_id: uuid.UUID,
+    payload: CancelRefundRequest,
+    service: PaymentServiceDep,
+    tenant_id: TenantDep,
+) -> RefundResponse:
+    """No se devuelve, se arregló de otra forma. Exige motivo y no mueve un peso."""
+    refund = await service.cancel_refund(
+        tenant_id, refund_id, payload.employee_id, payload.reason
+    )
+    return RefundResponse.model_validate(refund, from_attributes=True)
+
+
+# --- Comprobantes que manda el cliente --------------------------------------
+@router.get(
+    "/{order_id}/payment-claims",
+    response_model=list[PaymentClaimResponse],
+    dependencies=[_PAY],
+)
+async def list_payment_claims(
+    order_id: uuid.UUID,
+    service: PaymentServiceDep,
+    tenant_id: TenantDep,
+) -> list[PaymentClaimResponse]:
+    """Lo que el cliente dice haber pagado, para que una persona lo mire.
+
+    Bajo `orders.pay` y no `orders.read`: es la pantalla desde la que se decide cobrar, y
+    quien no puede cobrar no tiene por qué ver comprobantes bancarios de nadie.
+    """
+    claims = await service.list_payment_claims(tenant_id, order_id)
+    return [
+        PaymentClaimResponse.model_validate(c, from_attributes=True) for c in claims
+    ]
+
+
+@router.post(
+    "/{order_id}/payment-claims/{claim_id}/reject",
+    response_model=PaymentClaimResponse,
+    dependencies=[_PAY],
+)
+async def reject_payment_claim(
+    order_id: uuid.UUID,
+    claim_id: uuid.UUID,
+    payload: RejectPaymentClaimRequest,
+    service: PaymentServiceDep,
+    tenant_id: TenantDep,
+) -> PaymentClaimResponse:
+    """El comprobante no sirve. Exige motivo y no mueve un peso.
+
+    Aceptar no tiene endpoint propio a propósito: aceptar ES verificar el pago, y son el mismo
+    momento ("llegó, que lo cocinen"). Separarlos crearía el pedido aceptado que nadie cocina.
+    """
+    claim = await service.reject_payment_claim(
+        tenant_id, order_id, claim_id, payload.reason, payload.employee_id
+    )
+    return PaymentClaimResponse.model_validate(claim, from_attributes=True)
+
+
+@router.post(
+    "/{order_id}/verify-payment",
+    response_model=OrderResponse,
+    dependencies=[_PAY],
+)
+async def verify_payment(
+    order_id: uuid.UUID,
+    payload: VerifyPaymentRequest,
+    service: PaymentServiceDep,
+    tenant_id: TenantDep,
+) -> OrderResponse:
+    """Dar por bueno un pago prepagado y mandar el pedido a cocina, en un gesto.
+
+    Requiere `orders.pay`: verificar ES registrar un cobro, solo que mirando un comprobante
+    en vez de recibiendo la plata.
+    """
+    order = await service.verify_payment(tenant_id, order_id, payload.employee_id)
+    return OrderResponse.model_validate(order, from_attributes=True)
 
 
 @router.get(
@@ -252,6 +586,7 @@ async def add_item(
         payload.product_variant_id,
         payload.quantity,
         payload.unit_price,
+        payload.notes,
     )
     return OrderItemResponse.model_validate(item, from_attributes=True)
 
@@ -266,6 +601,19 @@ async def update_item_quantity(
     tenant_id: TenantDep,
 ) -> OrderItemResponse:
     item = await service.update_item_quantity(tenant_id, item_id, payload.quantity)
+    return OrderItemResponse.model_validate(item, from_attributes=True)
+
+
+@router.put(
+    "/items/{item_id}/notes", response_model=OrderItemResponse, dependencies=[_UPDATE]
+)
+async def set_item_notes(
+    item_id: uuid.UUID,
+    payload: SetItemNotesRequest,
+    service: OrderServiceDep,
+    tenant_id: TenantDep,
+) -> OrderItemResponse:
+    item = await service.set_item_notes(tenant_id, item_id, payload.notes)
     return OrderItemResponse.model_validate(item, from_attributes=True)
 
 

@@ -30,6 +30,26 @@ class IngredientModel(Base, TenantScopedMixin):
         index=True,
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # A diner may remove this insumo from a dish in the public carta (global per
+    # insumo, not per recipe line). Filters the "quitar" list; defaults to true.
+    is_customer_removable: Mapped[bool] = mapped_column(
+        Boolean, default=True, nullable=False
+    )
+    # Which kitchen station works this insumo ("la carne se trabaja en la parrilla").
+    # Feeds ONLY the station suggestion the kitchen derives from a product's recipe —
+    # `route_order` never reads it, `product_stations` stays its single source of truth.
+    #
+    # Scope mismatch on purpose: ingredients are tenant-scoped and kitchen_stations are
+    # branch-scoped, same as the pre-existing `product_stations`. The consumer absorbs it:
+    # the suggestion filters to the active branch and reports an ingredient whose default
+    # lives elsewhere as unassigned. Worst case in multi-branch is a thinner suggestion a
+    # human overrides, never a mis-routed comanda.
+    default_station_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey("kitchen_stations.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
 
 class RecipeItemModel(Base, TenantScopedMixin):
@@ -60,6 +80,18 @@ class RecipeItemModel(Base, TenantScopedMixin):
         Uuid,
         ForeignKey("units_of_measure.id", ondelete="RESTRICT"),
         nullable=False,
+        index=True,
+    )
+    # Dónde se trabaja ESTE insumo en ESTE plato. Override del default del insumo, no reemplazo:
+    # "¿dónde va el arroz?" no tiene respuesta global — se cocina en un plato y se fríe en otro —
+    # y la línea de receta es justo el par (plato, insumo) donde sí la tiene.
+    #
+    # `SET NULL` al borrar la estación: caer al default del insumo es la degradación correcta;
+    # bloquear o borrar una receta por reorganizar la cocina, no.
+    station_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey("kitchen_stations.id", ondelete="SET NULL"),
+        nullable=True,
         index=True,
     )
 

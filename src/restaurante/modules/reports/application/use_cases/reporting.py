@@ -20,6 +20,8 @@ from restaurante.modules.reports.domain.entities import (
     ProductMarginReport,
     ProfitAndLoss,
     RevenueSummary,
+    ShiftPendingSummary,
+    ShiftRecord,
     TopProduct,
     ZChannelLine,
     ZPaymentLine,
@@ -49,6 +51,35 @@ def _pct(part: Decimal, whole: Decimal) -> Decimal:
 class ReportsService:
     def __init__(self, repo: ReportsRepository) -> None:
         self._repo = repo
+
+    async def pending_summary(
+        self, tenant_id: uuid.UUID, cash_session_id: uuid.UUID
+    ) -> ShiftPendingSummary:
+        """Advisory pre-close view: what is still uncollected / undelivered this shift."""
+        count, total = await self._repo.uncollected_orders_for_session(
+            tenant_id, cash_session_id
+        )
+        undelivered = await self._repo.undelivered_deliveries_for_session(
+            tenant_id, cash_session_id
+        )
+        return ShiftPendingSummary(
+            uncollected_count=count,
+            uncollected_total=total,
+            undelivered_count=undelivered,
+        )
+
+    async def shift_record(
+        self, tenant_id: uuid.UUID, cash_session_id: uuid.UUID
+    ) -> ShiftRecord:
+        """The operational record (orders + deliveries) of a shift — history beside the Z."""
+        facts = await self._repo.get_session_facts(tenant_id, cash_session_id)
+        if facts is None:
+            raise NotFoundError(f"Sesión de caja no encontrada: {cash_session_id}")
+        orders = await self._repo.orders_for_session(tenant_id, cash_session_id)
+        deliveries = await self._repo.deliveries_for_session_detail(
+            tenant_id, cash_session_id
+        )
+        return ShiftRecord(orders=orders, deliveries=deliveries)
 
     async def z_report(
         self, tenant_id: uuid.UUID, cash_session_id: uuid.UUID

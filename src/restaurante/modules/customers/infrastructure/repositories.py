@@ -152,6 +152,30 @@ class SqlAlchemyCustomersRepository:
             return None
         return _customer(model, await self._person_for(model.person_id))
 
+    async def get_customer_by_phone(
+        self, tenant_id: uuid.UUID, phone: str
+    ) -> Customer | None:
+        """The tenant's customer whose backing person has this phone (oldest wins).
+
+        Backs the storefront's find-or-create: a returning customer identified only
+        by phone links to the same record instead of spawning a duplicate.
+        """
+        stmt = (
+            select(CustomerModel, PersonModel)
+            .join(PersonModel, CustomerModel.person_id == PersonModel.id)
+            .where(
+                CustomerModel.tenant_id == tenant_id,
+                PersonModel.phone == phone,
+            )
+            .order_by(CustomerModel.registered_at.asc())
+            .limit(1)
+        )
+        row = (await self._session.execute(stmt)).first()
+        if row is None:
+            return None
+        customer, person = row
+        return _customer(customer, person)
+
     async def list_customers(
         self, tenant_id: uuid.UUID, *, active: bool | None = None
     ) -> list[Customer]:

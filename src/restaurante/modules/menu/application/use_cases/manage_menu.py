@@ -293,8 +293,15 @@ class MenuService:
                 raise ValidationError(
                     "Algunas opciones no pertenecen a este producto."
                 )
+        # New variants are born inactive: not sellable until they have a recipe and
+        # are explicitly activated (guarded in `update_product_variant`).
         variant = await self._repo.create_product_variant(
-            ProductVariant(tenant_id=tenant_id, product_id=product_id, name=name),
+            ProductVariant(
+                tenant_id=tenant_id,
+                product_id=product_id,
+                name=name,
+                is_active=False,
+            ),
             option_ids,
         )
         return await self._variant_view(tenant_id, variant)
@@ -309,6 +316,22 @@ class MenuService:
     async def update_product_variant(
         self, tenant_id: uuid.UUID, variant_id: uuid.UUID, fields: dict[str, Any]
     ) -> ProductVariantView:
+        # Activation guard: una variante sólo sale a la venta cuando el negocio puede cumplir
+        # lo que promete — descontar su inventario Y prepararla. Desactivar y cualquier otra
+        # edición siguen sin guardas: sacar algo de la carta nunca puede estar bloqueado.
+        if fields.get("is_active") is True:
+            if not await self._repo.variant_has_recipe(tenant_id, variant_id):
+                raise ValidationError(
+                    "Registra la receta antes de ponerla a la venta."
+                )
+            # Sin estación no la prepara nadie: se vendería, se cobraría y la cocina nunca la
+            # vería. El mensaje dice qué falta y dónde se arregla, porque negarse a secas manda
+            # a adivinar.
+            if not await self._repo.variant_product_has_station(tenant_id, variant_id):
+                raise ValidationError(
+                    "Asígnale una estación de cocina al plato antes de ponerlo a la venta: "
+                    "sin ella nadie lo prepararía."
+                )
         updated = await self._repo.update_product_variant(tenant_id, variant_id, fields)
         if updated is None:
             raise NotFoundError(f"Variante no encontrada: {variant_id}")

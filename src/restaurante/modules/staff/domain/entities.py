@@ -24,6 +24,16 @@ class Employee:
     is_active: bool = True
     id: uuid.UUID | None = None
     hired_at: date | None = None
+    #: Teléfono de la persona (vive en `persons`, se lee de paso). Es a dónde el sistema le
+    #: escribe: hoy, las alertas escaladas por WhatsApp. Sin él, esa persona no recibe nada.
+    phone: str | None = None
+    #: Si quiere que le escriban cuando una alerta lleva rato sin que nadie la tome. Es una
+    #: elección, no un permiso: ver el panel y recibir un WhatsApp de noche son cosas
+    #: distintas, y antes estaban atadas al mismo `alerts.read`.
+    receives_alerts: bool = False
+    #: El chat de WhatsApp de esta persona, emparejado a mano. `None` = no se le puede
+    #: escribir todavía. Ver la migración 0026: por teléfono es imposible con un `@lid`.
+    whatsapp_contact_id: uuid.UUID | None = None
 
 
 @dataclass

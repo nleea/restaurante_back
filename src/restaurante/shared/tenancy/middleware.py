@@ -14,6 +14,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from restaurante.shared.api.prefix import api_path
 from restaurante.shared.database import SessionFactory
 from restaurante.shared.tenancy.context import (
     reset_current_tenant_id,
@@ -23,8 +24,18 @@ from restaurante.shared.tenancy.models import TenantModel
 
 # Rutas que no requieren tenant (documentación, salud, etc.)
 DEFAULT_EXEMPT_PATHS: frozenset[str] = frozenset(
-    {"/health", "/docs", "/redoc", "/openapi.json"}
+    api_path(p) for p in ("/health", "/docs", "/redoc", "/openapi.json")
 )
+
+# Prefijos exentos: callbacks de terceros que NO pueden traer el subdominio del tenant.
+#
+# El puente de WhatsApp llama desde su propio servidor a la URL pública que le dimos, así que
+# su Host es el de nuestro túnel/dominio, nunca `<slug>.<base_domain>`. Esos endpoints
+# resuelven el tenant por sí mismos a partir de algo del propio request (la sesión que
+# corresponde al `instance_ref` de la ruta) y se autentican con un secreto compartido.
+#
+# Es un prefijo y no una ruta exacta porque el `instance_ref` va en el path.
+DEFAULT_EXEMPT_PREFIXES: tuple[str, ...] = (api_path("/webhooks/"),)
 
 
 def _extract_subdomain(host: str, base_domain: str) -> str | None:
@@ -47,10 +58,12 @@ class TenantResolverMiddleware:
         app: ASGIApp,
         base_domain: str,
         exempt_paths: Iterable[str] = DEFAULT_EXEMPT_PATHS,
+        exempt_prefixes: Iterable[str] = DEFAULT_EXEMPT_PREFIXES,
     ) -> None:
         self.app = app
         self.base_domain = base_domain
         self.exempt_paths = frozenset(exempt_paths)
+        self.exempt_prefixes = tuple(exempt_prefixes)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -58,7 +71,7 @@ class TenantResolverMiddleware:
             return
 
         path = scope["path"]
-        if path in self.exempt_paths:
+        if path in self.exempt_paths or path.startswith(self.exempt_prefixes):
             await self.app(scope, receive, send)
             return
 

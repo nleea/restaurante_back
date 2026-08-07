@@ -183,6 +183,39 @@ async def test_deactivate_employee(client: AsyncClient) -> None:
     assert resp.json()["is_active"] is False
 
 
+async def test_reactivate_employee(client: AsyncClient) -> None:
+    await _assign_role("admin")
+    headers = await _login(client)
+    employee_id = await _create_employee(client, headers)
+    await client.delete(f"/staff/employees/{employee_id}", headers=headers)
+
+    resp = await client.post(
+        f"/staff/employees/{employee_id}/activate", headers=headers
+    )
+    assert resp.status_code == 200
+    assert resp.json()["is_active"] is True
+
+    # Reactivation is idempotent, and the employee is listed as active again.
+    resp = await client.post(
+        f"/staff/employees/{employee_id}/activate", headers=headers
+    )
+    assert resp.status_code == 200
+    listed = await client.get(
+        "/staff/employees", params={"active": "true"}, headers=headers
+    )
+    assert employee_id in [e["id"] for e in listed.json()]
+
+
+async def test_reactivate_unknown_employee_404(client: AsyncClient) -> None:
+    await _assign_role("admin")
+    headers = await _login(client)
+    resp = await client.post(
+        f"/staff/employees/{uuid.uuid4()}/activate", headers=headers
+    )
+    assert resp.status_code == 404
+    assert resp.json()["code"] == "not_found"
+
+
 # --- Planned shifts ---------------------------------------------------------
 async def test_shift_flow_and_time_validation(client: AsyncClient) -> None:
     await _assign_role("admin")

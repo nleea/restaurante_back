@@ -1,7 +1,7 @@
 """Rich demo dataset seed for live testing / pilot rehearsal.
 
 Layers a full operational dataset on top of the minimal baseline created by
-``scripts.seed`` (demo tenant ``demo``, branch ``MAIN``, admin user and RBAC).
+``scripts.seed`` (demo tenant ``demo``, branch ``main``, admin user and RBAC).
 It fills the cross-module flow end to end so screens and reports are non-empty:
 
     units / geo -> staff & drivers -> supplies (insumos) -> inventory stock
@@ -45,6 +45,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 # Register every model in Base.metadata (cross-module FKs) before touching them.
 import restaurante.shared.models_registry  # noqa: F401
+from restaurante.modules.business.infrastructure.models import OperatingHoursModel
 from restaurante.modules.cash.infrastructure.models import (
     CashMovementModel,
     CashSessionModel,
@@ -71,6 +72,7 @@ from restaurante.modules.identity.infrastructure.models import (
     PersonModel,
     RoleModel,
     UserModel,
+    UserRoleModel,
 )
 from restaurante.modules.inventory.infrastructure.models import (
     InventoryMovementModel,
@@ -111,10 +113,11 @@ from restaurante.modules.staff.infrastructure.models import (
     PlannedShiftModel,
     ShiftTemplateModel,
 )
+from restaurante.shared.config import get_settings
 from restaurante.shared.database import SessionFactory
 from restaurante.shared.security.password import Argon2PasswordHasher
 from restaurante.shared.tenancy.models import BranchModel, TenantModel
-from scripts.seed import DEMO_BRANCH_CODE, DEMO_SLUG
+from scripts.seed import DEMO_BRANCH_CODE, DEMO_EMAIL, DEMO_PASSWORD, DEMO_SLUG
 from scripts.seed import seed as seed_baseline
 
 # --- status / value constants (plain strings: no DB enum) ---------------------
@@ -215,6 +218,7 @@ async def seed_staff(
     branch_id: Any,
     staff_role_id: Any,
     city_id: Any,
+    courier_role_id: Any = None,
 ) -> dict[str, EmployeeModel]:
     hasher = Argon2PasswordHasher()
     specs = [
@@ -252,14 +256,53 @@ async def seed_staff(
                 "is_active": True,
             },
         )
-        employee, _ = await get_or_create(
-            session,
-            EmployeeModel,
-            tenant_id=tenant_id,
-            branch_id=branch_id,
-            person_id=person.id,
-            defaults={"user_id": user.id, "role_id": staff_role_id},
-        )
+        # Drivers get the courier role (delivery.drive); everyone else the generic staff role.
+        role_id = courier_role_id if key.startswith("driver") and courier_role_id else staff_role_id
+        # Se busca por PERSONA y por nada más: `ix_employees_person_id` es único sobre esa
+        # columna sola, así que una persona tiene un empleado y no uno por sede. Buscarlo por
+        # (tenant, sede, persona) encontraba nada y chocaba contra el índice al insertar —
+        # exactamente lo que pasa cuando alguien renombra su sede y se vuelve a sembrar.
+        employee = (
+            await session.execute(
+                select(EmployeeModel).where(EmployeeModel.person_id == person.id)
+            )
+        ).scalars().first()
+        if employee is None:
+            employee = EmployeeModel(
+                tenant_id=tenant_id,
+                branch_id=branch_id,
+                person_id=person.id,
+                user_id=user.id,
+                role_id=role_id,
+            )
+            session.add(employee)
+            await session.flush()
+            counts["EmployeeModel"] += 1
+        elif employee.branch_id != branch_id:
+            # Reasignarlo a la sede que esta siembra usa: si no, sus turnos y sus pedidos
+            # quedan repartidos entre dos sedes y ninguna pantalla cuadra.
+            employee.branch_id = branch_id
+        # Force the role even on an already-seeded employee, so re-seeding fixes the grant.
+        if employee.role_id != role_id:
+            employee.role_id = role_id
+        # Permissions come from the user↔role link (not employee.role_id): grant drivers the
+        # courier RBAC role so their user actually holds `delivery.drive` in the /driver app.
+        if key.startswith("driver") and courier_role_id:
+            exists = (
+                await session.execute(
+                    select(UserRoleModel).where(
+                        UserRoleModel.tenant_id == tenant_id,
+                        UserRoleModel.user_id == user.id,
+                        UserRoleModel.role_id == courier_role_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if exists is None:
+                session.add(
+                    UserRoleModel(
+                        tenant_id=tenant_id, user_id=user.id, role_id=courier_role_id
+                    )
+                )
         employees[key] = employee
     return employees
 
@@ -329,35 +372,40 @@ async def seed_shift_templates(
 
 
 # --- supplies (insumos) & inventory ------------------------------------------
-# name, unit, current stock, min stock — a few sit below the minimum on purpose
-# so the low-stock indicators light up.
+# name, unit, current stock, min stock, category, removable — a few sit below the minimum
+# on purpose so the low-stock indicators light up.
+#
+# `removable` es lo que el comensal ve como casilla "sin..." en la carta publica y en «mi
+# pedido». La columna nace en `True`, asi que SIN esta lista se podria pedir la hamburguesa
+# "sin sal" y "sin aceite": ruido que hace que la pantalla parezca de mentira. Se marca lo
+# que de verdad se quita en un mostrador y se deja fuera la base del plato.
 INGREDIENTS = [
-    # (name, unit, current, min, category)
-    ("Carne de res", "kg", Decimal("25.000"), Decimal("5.000"), "Carnes"),
-    ("Pechuga de pollo", "kg", Decimal("15.000"), Decimal("4.000"), "Carnes"),
-    ("Pan de hamburguesa", "und", Decimal("200.000"), Decimal("40.000"), "Panadería"),
-    ("Pan de perro", "und", Decimal("150.000"), Decimal("30.000"), "Panadería"),
-    ("Salchicha americana", "und", Decimal("180.000"), Decimal("36.000"), "Carnes"),
-    ("Queso cheddar", "kg", Decimal("1.500"), Decimal("2.000"), "Lácteos"),  # below min
-    ("Queso costeño", "kg", Decimal("6.000"), Decimal("1.500"), "Lácteos"),
-    ("Tocineta", "kg", Decimal("4.000"), Decimal("1.000"), "Carnes"),
-    ("Huevo", "und", Decimal("90.000"), Decimal("30.000"), "Lácteos"),
-    ("Tomate", "kg", Decimal("12.000"), Decimal("3.000"), "Verduras"),
-    ("Lechuga", "kg", Decimal("6.000"), Decimal("1.500"), "Verduras"),
-    ("Cebolla", "kg", Decimal("9.000"), Decimal("2.000"), "Verduras"),
-    ("Papa", "kg", Decimal("40.000"), Decimal("10.000"), "Verduras"),
-    ("Plátano verde", "kg", Decimal("18.000"), Decimal("4.000"), "Verduras"),
-    ("Aceite vegetal", "L", Decimal("3.000"), Decimal("4.000"), "Salsas"),  # below min
-    ("Arroz", "kg", Decimal("30.000"), Decimal("8.000"), "Granos"),
-    ("Camarón", "kg", Decimal("7.000"), Decimal("2.000"), "Pescados"),
-    ("Filete de sierra", "kg", Decimal("10.000"), Decimal("3.000"), "Pescados"),
-    ("Limón", "kg", Decimal("8.000"), Decimal("2.000"), "Verduras"),
-    ("Azúcar", "kg", Decimal("14.000"), Decimal("3.000"), "Granos"),
-    ("Sal", "kg", Decimal("10.000"), Decimal("2.000"), "Granos"),
-    ("Café molido", "kg", Decimal("3.500"), Decimal("1.000"), "Bebidas"),
-    ("Gaseosa lata", "und", Decimal("120.000"), Decimal("24.000"), "Bebidas"),
-    ("Salsa de tomate", "L", Decimal("6.000"), Decimal("1.500"), "Salsas"),
-    ("Mayonesa", "L", Decimal("5.000"), Decimal("1.500"), "Salsas"),
+    # (name, unit, current, min, category, removable)
+    ("Carne de res", "kg", Decimal("25.000"), Decimal("5.000"), "Carnes", False),
+    ("Pechuga de pollo", "kg", Decimal("15.000"), Decimal("4.000"), "Carnes", False),
+    ("Pan de hamburguesa", "und", Decimal("200.000"), Decimal("40.000"), "Panadería", False),
+    ("Pan de perro", "und", Decimal("150.000"), Decimal("30.000"), "Panadería", False),
+    ("Salchicha americana", "und", Decimal("180.000"), Decimal("36.000"), "Carnes", False),
+    ("Queso cheddar", "kg", Decimal("1.500"), Decimal("2.000"), "Lácteos", True),  # below min
+    ("Queso costeño", "kg", Decimal("6.000"), Decimal("1.500"), "Lácteos", True),
+    ("Tocineta", "kg", Decimal("4.000"), Decimal("1.000"), "Carnes", True),
+    ("Huevo", "und", Decimal("90.000"), Decimal("30.000"), "Lácteos", True),
+    ("Tomate", "kg", Decimal("12.000"), Decimal("3.000"), "Verduras", True),
+    ("Lechuga", "kg", Decimal("6.000"), Decimal("1.500"), "Verduras", True),
+    ("Cebolla", "kg", Decimal("9.000"), Decimal("2.000"), "Verduras", True),
+    ("Papa", "kg", Decimal("40.000"), Decimal("10.000"), "Verduras", False),
+    ("Plátano verde", "kg", Decimal("18.000"), Decimal("4.000"), "Verduras", False),
+    ("Aceite vegetal", "L", Decimal("3.000"), Decimal("4.000"), "Salsas", False),  # below min
+    ("Arroz", "kg", Decimal("30.000"), Decimal("8.000"), "Granos", False),
+    ("Camarón", "kg", Decimal("7.000"), Decimal("2.000"), "Pescados", False),
+    ("Filete de sierra", "kg", Decimal("10.000"), Decimal("3.000"), "Pescados", False),
+    ("Limón", "kg", Decimal("8.000"), Decimal("2.000"), "Verduras", True),
+    ("Azúcar", "kg", Decimal("14.000"), Decimal("3.000"), "Granos", False),
+    ("Sal", "kg", Decimal("10.000"), Decimal("2.000"), "Granos", False),
+    ("Café molido", "kg", Decimal("3.500"), Decimal("1.000"), "Bebidas", False),
+    ("Gaseosa lata", "und", Decimal("120.000"), Decimal("24.000"), "Bebidas", False),
+    ("Salsa de tomate", "L", Decimal("6.000"), Decimal("1.500"), "Salsas", True),
+    ("Mayonesa", "L", Decimal("5.000"), Decimal("1.500"), "Salsas", True),
 ]
 
 
@@ -368,7 +416,7 @@ async def seed_supplies(
     units: dict[str, UnitOfMeasureModel],
 ) -> dict[str, IngredientModel]:
     ingredients: dict[str, IngredientModel] = {}
-    for name, unit_abbr, current, minimum, category in INGREDIENTS:
+    for name, unit_abbr, current, minimum, category, removable in INGREDIENTS:
         ingredient, _ = await get_or_create(
             session,
             IngredientModel,
@@ -378,11 +426,16 @@ async def seed_supplies(
                 "unit_of_measure_id": units[unit_abbr].id,
                 "is_active": True,
                 "category": category,
+                "is_customer_removable": removable,
             },
         )
         # Idempotent touch-up: rows created before categories existed get theirs.
         if ingredient.category != category:
             ingredient.category = category
+        # Lo mismo con el flag: una base sembrada antes de esta lista tiene TODO marcado como
+        # quitable, y volver a sembrar tiene que corregirlo.
+        if ingredient.is_customer_removable != removable:
+            ingredient.is_customer_removable = removable
         ingredients[name] = ingredient
         await get_or_create(
             session,
@@ -878,42 +931,85 @@ async def seed_recipes(
 # --- kitchen (KDS): stations & product routing ---------------------------------
 STATIONS = ["Parrilla", "Freidora", "Plancha", "Ensamble", "Bebidas"]
 
-# product name -> [(station, role, tasks)]
+# insumo -> estación donde se trabaja. Es lo que permite derivar de la receta qué estación
+# prepara un plato: sin esto la sugerencia sale vacía y la función no se puede probar en vivo.
+# Deliberadamente incompleto: sal, aceite y azúcar se quedan sin estación para que el bucket de
+# "insumos sin estación" tenga contenido real — es un estado normal, no un error a esconder.
+INGREDIENT_STATIONS = {
+    "Carne de res": "Parrilla",
+    "Tocineta": "Parrilla",
+    "Pechuga de pollo": "Plancha",
+    "Salchicha americana": "Plancha",
+    "Huevo": "Plancha",
+    "Papa": "Freidora",
+    "Plátano verde": "Freidora",
+    "Camarón": "Freidora",
+    "Filete de sierra": "Freidora",
+    "Pan de hamburguesa": "Ensamble",
+    "Pan de perro": "Ensamble",
+    "Queso cheddar": "Ensamble",
+    "Queso costeño": "Ensamble",
+    "Tomate": "Ensamble",
+    "Lechuga": "Ensamble",
+    "Cebolla": "Ensamble",
+    "Salsa de tomate": "Ensamble",
+    "Mayonesa": "Ensamble",
+    "Arroz": "Plancha",
+    "Café molido": "Bebidas",
+    "Gaseosa lata": "Bebidas",
+    "Limón": "Bebidas",
+}
+
+# (plato, insumo) -> estación. El override que el default del insumo no puede expresar: el arroz
+# se cocina en la plancha en el arroz de camarón, pero este plato lo fríe. Sin esto, la
+# derivación mandaría el arroz frito a la plancha en cada plato nuevo que lo lleve.
+LINE_STATION_OVERRIDES: dict[tuple[str, str], str] = {
+    ("Arroz de Camarón", "Camarón"): "Plancha",
+}
+
+# product name -> [(station, role, pasos a mano)]
+#
+# Las tareas de insumo NO se escriben aquí: se calculan desde `RECIPES` + `INGREDIENT_STATIONS`
+# con el mismo formato que produce la derivación (ver `derived_tasks`). Escribirlas a mano era
+# garantizar que el demo naciera desviado —«Carne 150g» contra «Carne de res 0.15 kg»— y que el
+# aviso de deriva saltara en cada plato del dataset sin que nada estuviera mal de verdad.
+#
+# Lo que SÍ se escribe es lo que ninguna receta puede saber: los pasos que no son un insumo.
 PRODUCT_STATIONS = {
     "Hamburguesa Clásica": [
-        ("Parrilla", "Carne", ["Carne 150g", "Fundir cheddar"]),
-        ("Ensamble", None, ["Tostar pan", "Vegetales", "Armar"]),
+        ("Parrilla", "Carne", ["Fundir cheddar"]),
+        ("Ensamble", None, ["Tostar pan", "Armar"]),
     ],
     "Hamburguesa Doble": [
-        ("Parrilla", "Carne", ["Doble carne 300g", "Doble cheddar"]),
+        ("Parrilla", "Carne", ["Fundir cheddar"]),
         ("Ensamble", None, ["Tostar pan", "Armar"]),
     ],
     "Hamburguesa de Pollo": [
-        ("Plancha", "Pollo", ["Pechuga a la plancha"]),
-        ("Ensamble", None, ["Tostar pan", "Mayonesa de la casa", "Armar"]),
+        ("Plancha", "Pollo", []),
+        ("Ensamble", None, ["Tostar pan", "Armar"]),
     ],
     "Hamburguesa Costeña": [
-        ("Parrilla", "Carne", ["Carne 150g", "Tocineta crocante"]),
+        ("Parrilla", "Carne", ["Tocineta crocante"]),
         ("Freidora", None, ["Tajadas de maduro"]),
-        ("Ensamble", None, ["Queso costeño", "Armar"]),
+        ("Ensamble", None, ["Armar"]),
     ],
     "Perro Clásico": [
         ("Plancha", None, ["Dorar salchicha"]),
-        ("Ensamble", None, ["Salsas", "Papitas trituradas"]),
+        ("Ensamble", None, ["Papitas trituradas"]),
     ],
     "Perro Especial": [
         ("Plancha", None, ["Dorar salchicha", "Huevos de codorniz"]),
-        ("Ensamble", None, ["Tocineta", "Queso", "Armar"]),
+        ("Ensamble", None, ["Armar"]),
     ],
     "Salchipapa Sencilla": [
-        ("Freidora", None, ["Freír papa", "Salchicha en rodajas"]),
+        ("Freidora", None, ["Salchicha en rodajas"]),
     ],
     "Salchipapa Familiar": [
-        ("Freidora", None, ["Freír papa doble", "Salchicha y tocineta"]),
+        ("Freidora", None, ["Salchicha y tocineta"]),
         ("Ensamble", None, ["Gratinar queso", "Emplatar bandeja"]),
     ],
     "Arroz de Camarón": [
-        ("Plancha", "Del mar", ["Sofrito", "Sellar camarón", "Arroz cremoso"]),
+        ("Plancha", "Del mar", ["Sofrito", "Arroz cremoso"]),
     ],
     "Filete de Sierra": [
         ("Plancha", "Del mar", ["Filete 4 min por lado"]),
@@ -940,11 +1036,63 @@ PRODUCT_STATIONS = {
 }
 
 
+def _amount(quantity: Decimal, unit_abbr: str) -> str:
+    """Espejo de `_format_amount` del repositorio de cocina: `0.150` + `kg` → `0.15 kg`.
+
+    Si los dos formatos se separan, el dataset demo dispara el aviso de deriva en cada plato
+    sin que nada esté mal — que es exactamente lo que pasaba con las tareas escritas a mano.
+    """
+    text = f"{quantity:f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return f"{text} {unit_abbr}".strip()
+
+
+def derived_tasks(
+    product_name: str, station_name: str, ingredients: dict[str, IngredientModel]
+) -> list[dict[str, str | None]]:
+    """Lo que la derivación produciría para este plato en esta estación.
+
+    Mismo criterio que el endpoint: los insumos de la receta cuya estación efectiva es ésta.
+    La etiqueta NO lleva la cantidad — se resuelve al enrutar contra la receta de la variante
+    pedida — y sí lleva el `ingredient_id`, que es lo que hace posible esa resolución.
+    """
+    return [
+        {
+            "label": name,
+            "ingredient_id": str(ingredients[name].id) if name in ingredients else None,
+        }
+        for name, _quantity, _unit in RECIPES.get(product_name, [])
+        if _effective_station(product_name, name) == station_name
+    ]
+
+
+def _effective_station(product_name: str, ingredient_name: str) -> str | None:
+    """`COALESCE(override de la línea, default del insumo)`, igual que la derivación."""
+    override = LINE_STATION_OVERRIDES.get((product_name, ingredient_name))
+    return override or INGREDIENT_STATIONS.get(ingredient_name)
+
+
+def manual_step(label: str) -> dict[str, str | None]:
+    """Un paso que ninguna receta puede saber: nace sin insumo detrás."""
+    return {"label": label, "ingredient_id": None}
+
+
+def resolved_tasks(product_name: str, station_name: str) -> list[str]:
+    """Lo que la chit dice: etiqueta + cantidad, como la congela `route_order`."""
+    return [
+        f"{name} {_amount(quantity, unit)}"
+        for name, quantity, unit in RECIPES.get(product_name, [])
+        if _effective_station(product_name, name) == station_name
+    ]
+
+
 async def seed_kitchen(
     session: AsyncSession,
     tenant_id: Any,
     branch_id: Any,
     products: dict[str, dict[str, Any]],
+    ingredients: dict[str, IngredientModel],
 ) -> dict[str, KitchenStationModel]:
     stations: dict[str, KitchenStationModel] = {}
     for position, name in enumerate(STATIONS):
@@ -958,8 +1106,13 @@ async def seed_kitchen(
         )
         stations[name] = station
     for prod_name, mappings in PRODUCT_STATIONS.items():
-        for station_name, role, tasks in mappings:
-            await get_or_create(
+        for station_name, role, manual_steps in mappings:
+            # Insumos primero (es el orden en que el cocinero los toca), luego los pasos que
+            # ninguna receta puede saber.
+            tasks = derived_tasks(prod_name, station_name, ingredients) + [
+                manual_step(step) for step in manual_steps
+            ]
+            mapping, _ = await get_or_create(
                 session,
                 ProductStationModel,
                 tenant_id=tenant_id,
@@ -967,7 +1120,59 @@ async def seed_kitchen(
                 kitchen_station_id=stations[station_name].id,
                 defaults={"role": role, "tasks": tasks},
             )
+            # Retoque idempotente, como el de `category` en los insumos: una fila sembrada antes
+            # de que las tareas llevaran su insumo se quedaría con la forma vieja, y el demo no
+            # podría mostrar lo único que este cambio hace — la cantidad por variante.
+            if mapping.tasks != tasks:
+                mapping.tasks = tasks
+    # Se asigna aquí y no en `seed_supplies` porque las estaciones nacen en esta función.
+    # Idempotente y no destructivo: sólo escribe donde todavía no hay nada, así que una
+    # estación que alguien cambió a mano en la demo sobrevive a volver a sembrar.
+    for ingredient_name, station_name in INGREDIENT_STATIONS.items():
+        ingredient = ingredients.get(ingredient_name)
+        if ingredient is not None and ingredient.default_station_id is None:
+            ingredient.default_station_id = stations[station_name].id
     return stations
+
+
+# --- business profile: horario y telefono publico -----------------------------
+# Un dia a la semana cerrado a proposito (lunes): con TODOS los dias abiertos, "cerrado ·
+# abrimos el martes" no se puede ver nunca, y es justo el estado que mas se rompe.
+OPENING_HOURS = [
+    # (weekday 0=lunes, abre, cierra) — minutos desde medianoche
+    (1, 11 * 60, 22 * 60),
+    (2, 11 * 60, 22 * 60),
+    (3, 11 * 60, 22 * 60),
+    (4, 11 * 60, 23 * 60),
+    (5, 11 * 60, 23 * 60),
+    (6, 12 * 60, 21 * 60),
+]
+
+DEMO_BRANCH_PHONE = "+573001112233"
+
+
+async def seed_business_profile(
+    session: AsyncSession, tenant_id: Any, branch: BranchModel
+) -> None:
+    """Horario de la sede y su telefono publico.
+
+    Sin horario, la carta publica se anuncia "cerrado" a cualquier hora — el horario nace
+    vacio y una sede sin ventanas esta cerrada siempre. Sin telefono, «mi pedido» explica que
+    quitar un plato lo hace una persona y no puede decir como alcanzarla.
+    """
+    for weekday, opens, closes in OPENING_HOURS:
+        _, created = await get_or_create(
+            session,
+            OperatingHoursModel,
+            tenant_id=tenant_id,
+            branch_id=branch.id,
+            weekday=weekday,
+            defaults={"open_minute": opens, "close_minute": closes},
+        )
+        if created:
+            counts["operating_hours"] += 1
+    if not branch.phone:
+        branch.phone = DEMO_BRANCH_PHONE
 
 
 # --- customers ----------------------------------------------------------------
@@ -1079,10 +1284,11 @@ async def seed_delivery_routes(
                 tenant_id=tenant_id,
                 delivery_route_id=route.id,
                 employee_id=driver.id,
-                defaults={"is_active": True},
+                # branch_id is NOT NULL since 0013; derive it from the route.
+                defaults={"is_active": True, "branch_id": route.branch_id},
             )
         if driver is not None and run_status is not None:
-            defaults: dict[str, Any] = {}
+            defaults: dict[str, Any] = {"branch_id": route.branch_id}
             if run_status == RUN_IN_TRANSIT:
                 defaults["departed_at"] = NOW - timedelta(minutes=25)
             run, _ = await get_or_create(
@@ -1106,14 +1312,24 @@ async def seed_dining_tables(
 ) -> list[DiningTableModel]:
     tables: list[DiningTableModel] = []
     capacities = [2, 4, 4, 4, 6, 6, 8, 2]
-    for number, capacity in zip([str(n) for n in range(1, 9)], capacities, strict=True):
+    # Códigos fijos y legibles (`MESA01`…) en vez de acuñados al azar: es una semilla de demo, y
+    # poder teclear la URL del QR de la mesa 5 sin ir a mirar la base es justo lo que hace que
+    # esta pantalla se pueda probar. En producción los acuña el repositorio.
+    for index, (number, capacity) in enumerate(
+        zip([str(n) for n in range(1, 9)], capacities, strict=True), start=1
+    ):
         table, _ = await get_or_create(
             session,
             DiningTableModel,
             tenant_id=tenant_id,
             branch_id=branch_id,
             number=number,
-            defaults={"capacity": capacity, "status": "free", "is_active": True},
+            defaults={
+                "code": f"MESA{index:02d}",
+                "capacity": capacity,
+                "status": "free",
+                "is_active": True,
+            },
         )
         tables.append(table)
     return tables
@@ -1404,6 +1620,28 @@ LIVE_PLAN: list[dict[str, Any]] = [
         "tickets": {"Salchipapa Familiar": TICKET_PENDING, "Gaseosa Lata": TICKET_PENDING},
         "minutes_ago": 5,
     },
+    # Dos comensales que pidieron ELLOS MISMOS escaneando el QR de la mesa 7, cada uno con su
+    # comanda. Es el escenario que el pedido por QR introduce y que antes no existía en ninguna
+    # semilla: una mesa sosteniendo más de una comanda viva. Sin él no se puede mirar ni el
+    # sello del pase ni la mesa que NO se libera cuando el primero paga.
+    {
+        "channel": CHANNEL_DINE_IN,
+        "table": 6,
+        "diner_name": "Ana",
+        "origin": "qr",
+        "items": [("Hamburguesa Clásica", 1), ("Limonada Natural", 1)],
+        "tickets": {"Hamburguesa Clásica": TICKET_IN_PROGRESS, "Limonada Natural": TICKET_READY},
+        "minutes_ago": 9,
+    },
+    {
+        "channel": CHANNEL_DINE_IN,
+        "table": 6,
+        "diner_name": "Luis",
+        "origin": "qr",
+        "items": [("Perro Clásico", 2)],
+        "tickets": {"Perro Clásico": TICKET_PENDING},
+        "minutes_ago": 4,
+    },
     {
         "channel": CHANNEL_TAKEOUT,
         "items": [("Arroz de Camarón", 1)],
@@ -1495,6 +1733,8 @@ async def _create_order(
         dining_table_id=tables[entry["table"]].id if "table" in entry else None,
         customer_id=customers[entry["customer"]].id if "customer" in entry else None,
         employee_id=employee.id,
+        diner_name=entry.get("diner_name"),
+        origin=entry.get("origin", "staff"),
         status=status,
         kitchen_state=kitchen_state,
         subtotal=Decimal("0.00"),
@@ -1591,6 +1831,7 @@ async def seed_orders(
             session.add(
                 OrderDeliveryModel(
                     tenant_id=tenant_id,
+                    branch_id=branch_id,
                     order_id=order.id,
                     address_text=entry["address"],
                     neighborhood=entry["zone"],
@@ -1630,7 +1871,10 @@ async def seed_orders(
         # KDS tickets: fan each item out to its product's stations.
         for item, (prod_name, _qty) in zip(items, entry["items"], strict=True):
             ticket_status = entry["tickets"][prod_name]
-            for station_name, role, tasks in PRODUCT_STATIONS.get(prod_name, []):
+            for station_name, role, manual_steps in PRODUCT_STATIONS.get(prod_name, []):
+                # Copia congelada YA RESUELTA, igual que la deja `route_order`: el ticket lleva
+                # texto con la cantidad de lo que se pidió, no la estructura de configuración.
+                tasks = resolved_tasks(prod_name, station_name) + manual_steps
                 session.add(
                     OrderItemStationModel(
                         tenant_id=tenant_id,
@@ -1675,6 +1919,7 @@ async def seed_orders(
             session.add(
                 OrderDeliveryModel(
                     tenant_id=tenant_id,
+                    branch_id=branch_id,
                     order_id=order.id,
                     delivery_route_id=route_info["route"].id if route_info else None,
                     delivery_run_id=(
@@ -1751,6 +1996,48 @@ async def seed_finance(
         counts["expenses"] += 1
 
 
+# --- guia de la prueba manual --------------------------------------------------
+# El recorrido de «mi pedido» de punta a punta. Se imprime al sembrar porque el orden
+# importa: la ventana por item se cierra al empezar a cocinar, y una vez cerrada hay que
+# volver a pedir para verla abierta.
+#
+# El codigo de la sede y el dominio salen de la BASE y de la configuracion, no de estas
+# constantes: `branches.code` se edita desde el panel, y una guia que diga "/store/main"
+# cuando la sede se llama "MAIN" manda al 404 a quien la sigue.
+def walkthrough(branch_code: str) -> str:
+    base_domain = get_settings().base_domain
+    host = f"{DEMO_SLUG}.localhost:5173"
+    warning = ""
+    if base_domain != "localhost":
+        warning = (
+            f"\n  OJO: BASE_DOMAIN={base_domain}. El front de desarrollo sirve en "
+            f"{host} y el\n       backend resuelve el tenant por el Host, asi que con ese "
+            "valor no encuentra ningun\n       tenant. Pon BASE_DOMAIN=localhost en "
+            "backend/.env para el recorrido local.\n"
+        )
+    return f"""
+Recorrido de «mi pedido» (pnpm dev en front/, uvicorn en backend/):
+{warning}
+  1. Carta      http://{host}/store/{branch_code}
+                Pide una "Hamburguesa Clasica" — es la que lleva lechuga, tomate y queso
+                como quitables. La caja del turno ya esta abierta, asi que el pedido entra.
+                (El horario solo INFORMA: aunque diga "cerrado", la caja es la que manda.)
+  2. El enlace  Al confirmar, el ticket ofrece "Corregir mi pedido" → /my-order/<token>.
+                Ahi quita la lechuga con el pedido aun sin enviar: no cuesta nada y se
+                guarda sin tocar el total.
+  3. Cocina     http://{host}/floor → abre la comanda y enviala.
+                Vuelve al enlace, anade unas papas y miralas aparecer en /kitchen: lo
+                anadido se enruta solo porque el resto del pedido ya estaba alli.
+  4. Empezado   En /kitchen empieza a preparar ESE item. El enlace lo deja inerte y
+                explicado; los demas renglones siguen editables.
+  5. Domicilio  Pide otro, esta vez a domicilio, y llevalo a `ready` en /kitchen. Con la
+                entrega aun en el pase, anadir TODAVIA se puede. Pasala a "en camino" en
+                /dispatch y la vista entera se apaga.
+
+  Admin: {DEMO_EMAIL} / {DEMO_PASSWORD}
+"""
+
+
 # --- orchestrator -------------------------------------------------------------
 async def seed_demo() -> None:
     # 1. Guarantee the baseline (tenant/branch/admin/RBAC) exists and is committed.
@@ -1764,10 +2051,11 @@ async def seed_demo() -> None:
             await session.execute(
                 select(BranchModel).where(
                     BranchModel.tenant_id == tenant.id,
-                    BranchModel.code == DEMO_BRANCH_CODE,
+                    func.lower(BranchModel.code) == DEMO_BRANCH_CODE.lower(),
                 )
             )
-        ).scalar_one()
+        ).scalars().first()
+        assert branch is not None, "la sede demo tiene que existir tras el baseline"
 
         roles = (
             (await session.execute(select(RoleModel).where(RoleModel.is_global.is_(True))))
@@ -1776,10 +2064,15 @@ async def seed_demo() -> None:
         )
         admin_role = next(r for r in roles if r.name == ADMIN_ROLE_NAME)
         staff_role = next((r for r in roles if r.name != ADMIN_ROLE_NAME), admin_role)
+        # Drivers are couriers: they hold `delivery.drive` and work their own despacho
+        # from the /driver app. Fall back to the generic staff role if `courier` is absent.
+        courier_role = next((r for r in roles if r.name == "courier"), staff_role)
 
         units = await seed_units(session)
         city = await seed_geo(session)
-        employees = await seed_staff(session, tenant.id, branch.id, staff_role.id, city.id)
+        employees = await seed_staff(
+            session, tenant.id, branch.id, staff_role.id, city.id, courier_role.id
+        )
         await seed_shift_templates(session, tenant.id, branch.id, employees)
         cashier = employees["cashier"]
         cashier2 = employees["cashier2"]
@@ -1796,8 +2089,11 @@ async def seed_demo() -> None:
         products = await seed_menu(session, tenant.id, branch.id)
         await seed_addons(session, tenant.id, products)
         await seed_recipes(session, tenant.id, products, ingredients, units)
-        stations = await seed_kitchen(session, tenant.id, branch.id, products)
+        stations = await seed_kitchen(
+            session, tenant.id, branch.id, products, ingredients
+        )
 
+        await seed_business_profile(session, tenant.id, branch)
         customers = await seed_customers(session, tenant.id, city.id)
         await seed_delivery_settings(session, tenant.id, branch.id)
         routes = await seed_delivery_routes(session, tenant.id, branch.id, employees)
@@ -1823,6 +2119,7 @@ async def seed_demo() -> None:
         await seed_finance(session, tenant.id, branch.id, cashier)
 
         await session.commit()
+        branch_code = branch.code
 
     if counts:
         print("Demo dataset seeded (rows created this run):")
@@ -1830,6 +2127,7 @@ async def seed_demo() -> None:
             print(f"  {table:<24} {counts[table]}")
     else:
         print("Demo dataset already present: nothing to create.")
+    print(walkthrough(branch_code))
 
 
 if __name__ == "__main__":

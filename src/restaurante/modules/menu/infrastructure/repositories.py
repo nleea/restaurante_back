@@ -13,10 +13,11 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import delete as sql_delete
-from sqlalchemy import func, select
+from sqlalchemy import exists, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from restaurante.modules.kitchen.infrastructure.models import ProductStationModel
 from restaurante.modules.menu.domain.entities import (
     Addon,
     Category,
@@ -29,6 +30,7 @@ from restaurante.modules.menu.domain.entities import (
 from restaurante.modules.menu.infrastructure.models import (
     AddonModel,
     CategoryModel,
+    MenuAppearanceModel,
     ProductAddonModel,
     ProductModel,
     ProductPriceModel,
@@ -37,6 +39,7 @@ from restaurante.modules.menu.infrastructure.models import (
     VariantGroupModel,
     VariantOptionModel,
 )
+from restaurante.modules.recipes.infrastructure.models import RecipeItemModel
 from restaurante.shared.domain.errors import ConflictError
 from restaurante.shared.tenancy.models import BranchModel
 
@@ -527,6 +530,46 @@ class SqlAlchemyMenuRepository:
         )
         return Decimal((await self._session.execute(stmt)).scalar_one())
 
+    async def variant_product_has_station(
+        self, tenant_id: uuid.UUID, variant_id: uuid.UUID
+    ) -> bool:
+        """True cuando el PRODUCTO de la variante lo prepara al menos una estación.
+
+        Lectura cruzada al módulo de cocina, igual que `variant_has_recipe` la hace a recetas, en
+        vez de acoplar la aplicación del menú a otro servicio.
+
+        Mira el producto y no la variante a propósito: quién cocina algo no cambia con el tamaño.
+        """
+        # El producto de la variante, como subconsulta escalar: `exists()` no encadena `join`.
+        product_of_variant = (
+            select(ProductVariantModel.product_id)
+            .where(ProductVariantModel.id == variant_id)
+            .scalar_subquery()
+        )
+        stmt = select(
+            exists().where(
+                ProductStationModel.tenant_id == tenant_id,
+                ProductStationModel.product_id == product_of_variant,
+            )
+        )
+        return bool((await self._session.execute(stmt)).scalar())
+
+    async def variant_has_recipe(
+        self, tenant_id: uuid.UUID, variant_id: uuid.UUID
+    ) -> bool:
+        """True when the variant has ≥1 recipe item (reads the recipes table).
+
+        Mirrors the cross-module read done by orders' `consume_inventory_for_order`
+        rather than coupling the menu application to the recipes service.
+        """
+        stmt = select(
+            exists().where(
+                RecipeItemModel.tenant_id == tenant_id,
+                RecipeItemModel.product_variant_id == variant_id,
+            )
+        )
+        return bool((await self._session.execute(stmt)).scalar())
+
     async def product_option_ids(
         self, tenant_id: uuid.UUID, product_id: uuid.UUID
     ) -> set[uuid.UUID]:
@@ -641,3 +684,30 @@ class SqlAlchemyMenuRepository:
             )
         )
         await self._session.commit()
+
+    # --- Appearance (public carta config) ----------------------------------
+    async def _get_appearance_model(
+        self, tenant_id: uuid.UUID
+    ) -> MenuAppearanceModel | None:
+        stmt = select(MenuAppearanceModel).where(
+            MenuAppearanceModel.tenant_id == tenant_id
+        )
+        return (await self._session.execute(stmt)).scalar_one_or_none()
+
+    async def get_appearance(self, tenant_id: uuid.UUID) -> dict[str, Any] | None:
+        model = await self._get_appearance_model(tenant_id)
+        return dict(model.config) if model else None
+
+    async def upsert_appearance(
+        self, tenant_id: uuid.UUID, config: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Insert or overwrite the tenant's single appearance row."""
+        model = await self._get_appearance_model(tenant_id)
+        if model is None:
+            model = MenuAppearanceModel(tenant_id=tenant_id, config=config)
+            self._session.add(model)
+        else:
+            model.config = config
+        await self._session.commit()
+        await self._session.refresh(model)
+        return dict(model.config)

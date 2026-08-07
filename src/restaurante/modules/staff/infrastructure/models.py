@@ -62,6 +62,30 @@ class EmployeeModel(Base, BranchScopedMixin):
         Date, server_default=func.current_date(), nullable=False
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # ¿A esta persona se le escribe por WhatsApp cuando una alerta lleva rato sin que nadie
+    # la tome?
+    #
+    # Es una elección explícita y NO un permiso, porque son dos cosas distintas que antes
+    # estaban mezcladas: "puede ver el panel de alertas" y "le suena el móvil a las once de
+    # la noche". Con sólo el permiso, quien debía ver la pantalla pero no recibir mensajes no
+    # tenía salida — había que quitarle también la pantalla.
+    #
+    # Nace apagado, como todo en este módulo: encender el escalado no le escribe a nadie
+    # hasta que alguien señale a una persona.
+    receives_alerts: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, server_default="false"
+    )
+    # A QUÉ chat de WhatsApp se le escribe, emparejado a mano.
+    #
+    # No se deduce del teléfono porque no se puede: en modo privacidad WhatsApp manda un
+    # `@lid` en vez del número, y de esos contactos nunca sabemos el teléfono. La única
+    # señal fiable de "se le puede escribir" es que ya escribió, así que se elige de entre
+    # los chats que existen.
+    whatsapp_contact_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey("whatsapp_contacts.id", ondelete="SET NULL"),
+        nullable=True,
+    )
 
 
 class ShiftTemplateModel(Base, BranchScopedMixin, TimestampMixin):

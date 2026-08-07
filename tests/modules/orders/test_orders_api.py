@@ -9,6 +9,7 @@ from httpx import AsyncClient
 from scripts.seed import seed_rbac
 from sqlalchemy import select
 
+from restaurante.modules.catalog.infrastructure.models import UnitOfMeasureModel
 from restaurante.modules.identity.infrastructure.models import PersonModel, UserModel
 from restaurante.modules.identity.infrastructure.repositories import (
     SqlAlchemyRbacRepository,
@@ -22,10 +23,15 @@ from restaurante.modules.menu.infrastructure.models import (
 from restaurante.modules.orders.infrastructure.repositories import (
     SqlAlchemyOrdersRepository,
 )
+from restaurante.modules.recipes.infrastructure.models import (
+    IngredientModel,
+    RecipeItemModel,
+)
 from restaurante.modules.staff.infrastructure.models import EmployeeModel
 from restaurante.shared.database import SessionFactory
 from restaurante.shared.tenancy.models import BranchModel, TenantModel
 from tests.conftest import TEST_EMAIL, TEST_PASSWORD
+from tests.modules._cash import seed_open_cash_session
 
 
 async def _demo_ids() -> tuple[uuid.UUID, uuid.UUID]:
@@ -114,6 +120,25 @@ async def _create_variant(name: str = "Classic - L") -> uuid.UUID:
             tenant_id=tenant_id, product_id=product.id, name=name, is_active=True
         )
         session.add(variant)
+        await session.flush()
+        # A sellable variant must have a recipe (order add-item safety net); give it one.
+        unit = UnitOfMeasureModel(name="unit", abbreviation="und")
+        session.add(unit)
+        await session.flush()
+        ingredient = IngredientModel(
+            tenant_id=tenant_id, name="Beef", unit_of_measure_id=unit.id, is_active=True
+        )
+        session.add(ingredient)
+        await session.flush()
+        session.add(
+            RecipeItemModel(
+                tenant_id=tenant_id,
+                product_variant_id=variant.id,
+                ingredient_id=ingredient.id,
+                quantity=Decimal("1"),
+                unit_of_measure_id=unit.id,
+            )
+        )
         await session.commit()
         await session.refresh(variant)
         return variant.id
@@ -134,6 +159,7 @@ async def _create_addon(name: str = "Cheese", price: str = "2000") -> uuid.UUID:
 async def _setup_order(client: AsyncClient, headers: dict[str, str]) -> dict[str, str]:
     branch_id = await _create_branch()
     employee_id = await _create_employee(branch_id)
+    await seed_open_cash_session(branch_id, employee_id)
     variant_id = await _create_variant()
     table_resp = await client.post(
         "/orders/tables",
@@ -260,6 +286,12 @@ async def test_items_and_totals_recompute(client: AsyncClient) -> None:
         f"/orders/{order_id}/discount", headers=headers, json={"discount": "2000"}
     )
     assert Decimal(disc.json()["total"]) == Decimal("10000")
+    # Un pedido que NO es domicilio no paga domicilio, y su total no lo menciona. Desde que la
+    # columna existe, `total = subtotal − descuento + delivery_fee` para TODOS: si el cargo no
+    # fuera cero aquí, cada pedido de mostrador subiría de precio con la migración.
+    assert Decimal(disc.json()["subtotal"]) - Decimal("2000") == Decimal(
+        disc.json()["total"]
+    )
 
     # discount above subtotal -> 422
     bad = await client.put(
@@ -272,6 +304,81 @@ async def test_items_and_totals_recompute(client: AsyncClient) -> None:
     assert rm.status_code == 204
     order = await client.get(f"/orders/{order_id}", headers=headers)
     assert Decimal(order.json()["subtotal"]) == Decimal("0")
+
+
+async def test_set_item_notes_edits_and_clears(client: AsyncClient) -> None:
+    """The waiter writes the kitchen note on the dupe, after the item is already stamped."""
+    await _assign_role("admin")
+    headers = await _login(client)
+    ctx = await _setup_order(client, headers)
+    order_id, variant_id = ctx["order_id"], ctx["variant_id"]
+
+    add = await client.post(
+        f"/orders/{order_id}/items",
+        headers=headers,
+        json={"product_variant_id": variant_id, "quantity": 1, "unit_price": "10000"},
+    )
+    item_id = add.json()["id"]
+    assert add.json()["notes"] is None  # born without a note
+
+    # set
+    upd = await client.put(
+        f"/orders/items/{item_id}/notes", headers=headers, json={"notes": "sin cebolla"}
+    )
+    assert upd.status_code == 200
+    assert upd.json()["notes"] == "sin cebolla"
+
+    # correcting it later replaces the note; money is untouched
+    again = await client.put(
+        f"/orders/items/{item_id}/notes",
+        headers=headers,
+        json={"notes": "  sin cebolla, bien cocida  "},
+    )
+    assert again.json()["notes"] == "sin cebolla, bien cocida"  # trimmed
+    assert Decimal(again.json()["line_subtotal"]) == Decimal("10000")
+
+    # an emptied field clears the note rather than storing ""
+    cleared = await client.put(
+        f"/orders/items/{item_id}/notes", headers=headers, json={"notes": "   "}
+    )
+    assert cleared.json()["notes"] is None
+
+    # over the 255-char limit is rejected
+    too_long = await client.put(
+        f"/orders/items/{item_id}/notes", headers=headers, json={"notes": "x" * 256}
+    )
+    assert too_long.status_code == 422
+
+
+async def test_set_item_notes_on_non_open_order_conflicts(client: AsyncClient) -> None:
+    """Notes stay editable only while the order is open — a settled dupe is frozen."""
+    await _assign_role("admin")
+    headers = await _login(client)
+    ctx = await _setup_order(client, headers)
+    order_id = ctx["order_id"]
+
+    add = await client.post(
+        f"/orders/{order_id}/items",
+        headers=headers,
+        json={
+            "product_variant_id": ctx["variant_id"],
+            "quantity": 1,
+            "unit_price": "10000",
+        },
+    )
+    item_id = add.json()["id"]
+
+    cancel = await client.post(
+        f"/orders/{order_id}/cancel",
+        headers=headers,
+        json={"reason": "client left", "requested_by_employee_id": ctx["employee_id"]},
+    )
+    assert cancel.status_code == 200
+
+    late = await client.put(
+        f"/orders/items/{item_id}/notes", headers=headers, json={"notes": "tarde"}
+    )
+    assert late.status_code == 409
 
 
 async def test_add_item_to_closed_order_conflicts(client: AsyncClient) -> None:

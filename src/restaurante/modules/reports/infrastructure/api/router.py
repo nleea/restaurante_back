@@ -21,6 +21,7 @@ from restaurante.modules.reports.infrastructure.api.schemas import (
     ProductMarginReportResponse,
     ProfitAndLossResponse,
     RevenueSummaryResponse,
+    ShiftRecordResponse,
     TopProductResponse,
     ZReportResponse,
 )
@@ -41,6 +42,21 @@ async def z_report(
 ) -> ZReportResponse:
     report = await service.z_report(tenant_id, cash_session_id)
     return ZReportResponse.model_validate(report, from_attributes=True)
+
+
+@router.get(
+    "/shift/{cash_session_id}",
+    response_model=ShiftRecordResponse,
+    dependencies=[_READ],
+)
+async def shift_record(
+    cash_session_id: uuid.UUID,
+    service: ReportsServiceDep,
+    tenant_id: TenantDep,
+) -> ShiftRecordResponse:
+    """A closed shift's operational record (orders + deliveries) beside its Reporte Z."""
+    record = await service.shift_record(tenant_id, cash_session_id)
+    return ShiftRecordResponse.model_validate(record, from_attributes=True)
 
 
 @router.get("/revenue", response_model=RevenueSummaryResponse, dependencies=[_READ])

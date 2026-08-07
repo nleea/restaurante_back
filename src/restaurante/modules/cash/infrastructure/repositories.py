@@ -20,6 +20,11 @@ from restaurante.modules.cash.infrastructure.models import (
     CashMovementModel,
     CashSessionModel,
 )
+from restaurante.modules.delivery.domain.entities import (
+    DELIVERY_TERMINAL_STATUSES,
+)
+from restaurante.modules.delivery.infrastructure.models import OrderDeliveryModel
+from restaurante.modules.orders.infrastructure.models import OrderModel
 from restaurante.modules.staff.infrastructure.models import EmployeeModel
 from restaurante.shared.tenancy.models import BranchModel
 
@@ -42,6 +47,9 @@ def _session(m: CashSessionModel) -> CashSession:
         expected_amount=m.expected_amount,
         difference=m.difference,
         closed_at=m.closed_at,
+        notes=m.notes,
+        incident=m.incident,
+        incident_note=m.incident_note,
     )
 
 
@@ -56,6 +64,8 @@ def _movement(m: CashMovementModel) -> CashMovement:
         amount=m.amount,
         method=m.method,
         reference_id=m.reference_id,
+        category=m.category,
+        created_at=m.created_at,
     )
 
 
@@ -156,6 +166,7 @@ class SqlAlchemyCashRepository:
             concept=movement.concept,
             amount=movement.amount,
             method=movement.method,
+            category=movement.category,
             reference_id=movement.reference_id,
         )
         self._session.add(model)
@@ -166,15 +177,47 @@ class SqlAlchemyCashRepository:
     async def list_movements(
         self, tenant_id: uuid.UUID, session_id: uuid.UUID
     ) -> list[CashMovement]:
+        # LEFT JOIN al pedido referenciado para traer su cuenta de mesa. Se hace aquí y no en
+        # el navegador porque la relación la conoce la base: reconstruirla en el front pediría
+        # una llamada por movimiento.
         stmt = (
-            select(CashMovementModel)
+            select(CashMovementModel, OrderModel.table_bill_id)
+            .outerjoin(OrderModel, OrderModel.id == CashMovementModel.reference_id)
             .where(
                 CashMovementModel.tenant_id == tenant_id,
                 CashMovementModel.cash_session_id == session_id,
             )
             .order_by(CashMovementModel.created_at)
         )
-        return [_movement(m) for m in (await self._session.execute(stmt)).scalars()]
+        rows = (await self._session.execute(stmt)).all()
+        movements = []
+        for model, bill_id in rows:
+            movement = _movement(model)
+            movement.table_bill_id = bill_id
+            movements.append(movement)
+        return movements
+
+    async def unresolved_deliveries(
+        self, tenant_id: uuid.UUID, cash_session_id: uuid.UUID
+    ) -> list[tuple[uuid.UUID, str]]:
+        """Las entregas del turno que todavía no tienen desenlace.
+
+        Se devuelven, no se cuentan: el cajero necesita saber CUÁLES para poder ir a
+        resolverlas, no solo que existen.
+        """
+        stmt = (
+            select(OrderDeliveryModel.id, OrderDeliveryModel.delivery_status)
+            .join(OrderModel, OrderDeliveryModel.order_id == OrderModel.id)
+            .where(
+                OrderDeliveryModel.tenant_id == tenant_id,
+                OrderModel.cash_session_id == cash_session_id,
+                OrderDeliveryModel.delivery_status.notin_(
+                    DELIVERY_TERMINAL_STATUSES
+                ),
+            )
+            .order_by(OrderDeliveryModel.created_at)
+        )
+        return [(row[0], row[1]) for row in (await self._session.execute(stmt)).all()]
 
     async def cash_totals(
         self, tenant_id: uuid.UUID, session_id: uuid.UUID

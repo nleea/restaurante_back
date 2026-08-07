@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # Registra todos los modelos en Base.metadata (FKs cruzadas, p.ej. tenants->cities).
@@ -32,10 +32,12 @@ from restaurante.modules.identity.infrastructure.models import (
 )
 from restaurante.shared.database import SessionFactory
 from restaurante.shared.security.password import Argon2PasswordHasher
+from restaurante.shared.tenancy.branch_code import validate_branch_code
 from restaurante.shared.tenancy.models import BranchModel, TenantModel
 
 DEMO_SLUG = "demo"
-DEMO_BRANCH_CODE = "MAIN"
+# Slug-form: the code addresses the branch in the public carta URL (/store/<code>).
+DEMO_BRANCH_CODE = "main"
 DEMO_EMAIL = "admin@demo.com"
 DEMO_PASSWORD = "admin1234"
 
@@ -123,19 +125,22 @@ async def seed() -> None:
         else:
             print(f"Tenant already exists: {tenant.slug} ({tenant.id})")
 
+        # Sin mayúsculas: el código de la sede se edita desde el panel, y un negocio que
+        # renombró la suya a "MAIN" no puede acabar con DOS sedes principales cada vez que
+        # alguien vuelve a sembrar. Se busca la que ya existe antes de crear otra.
         branch = (
             await session.execute(
                 select(BranchModel).where(
                     BranchModel.tenant_id == tenant.id,
-                    BranchModel.code == DEMO_BRANCH_CODE,
+                    func.lower(BranchModel.code) == DEMO_BRANCH_CODE.lower(),
                 )
             )
-        ).scalar_one_or_none()
+        ).scalars().first()
         if branch is None:
             session.add(
                 BranchModel(
                     tenant_id=tenant.id,
-                    code=DEMO_BRANCH_CODE,
+                    code=validate_branch_code(DEMO_BRANCH_CODE),
                     name="Main Branch",
                     is_active=True,
                 )

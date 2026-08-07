@@ -150,6 +150,16 @@ class MenuRepository(Protocol):
         self, tenant_id: uuid.UUID, variant_id: uuid.UUID
     ) -> Decimal: ...
 
+    async def variant_product_has_station(
+        self, tenant_id: uuid.UUID, variant_id: uuid.UUID
+    ) -> bool:
+        """True cuando el producto de la variante lo prepara al menos una estación."""
+        ...
+
+    async def variant_has_recipe(
+        self, tenant_id: uuid.UUID, variant_id: uuid.UUID
+    ) -> bool: ...
+
     async def product_option_ids(
         self, tenant_id: uuid.UUID, product_id: uuid.UUID
     ) -> set[uuid.UUID]: ...
@@ -182,3 +192,12 @@ class MenuRepository(Protocol):
     async def detach_addon(
         self, tenant_id: uuid.UUID, product_id: uuid.UUID, addon_id: uuid.UUID
     ) -> None: ...
+
+    # --- Appearance (public carta config) ----------------------------------
+    async def get_appearance(
+        self, tenant_id: uuid.UUID
+    ) -> dict[str, Any] | None: ...
+
+    async def upsert_appearance(
+        self, tenant_id: uuid.UUID, config: dict[str, Any]
+    ) -> dict[str, Any]: ...

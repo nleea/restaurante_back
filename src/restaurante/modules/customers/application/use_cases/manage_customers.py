@@ -82,6 +82,32 @@ class CustomerService:
             Customer(tenant_id=tenant_id, person_id=uuid.uuid4(), user_id=user_id),
         )
 
+    async def find_or_create_by_phone(
+        self, tenant_id: uuid.UUID, name: str, phone: str
+    ) -> Customer:
+        """Return the existing customer with this phone, or create one from name + phone.
+
+        Backs public order intake (storefront): a returning customer keyed only by phone
+        reuses their record; a new phone spawns a customer once. The free-text ``name`` is
+        split into first / last on the first space (the person model needs both).
+        """
+        cleaned_phone = phone.strip()
+        if not cleaned_phone:
+            raise ValidationError("El teléfono es obligatorio.")
+        existing = await self._repo.get_customer_by_phone(tenant_id, cleaned_phone)
+        if existing is not None:
+            return existing
+        cleaned_name = name.strip()
+        if not cleaned_name:
+            raise ValidationError("El nombre es obligatorio.")
+        first_name, _, last_name = cleaned_name.partition(" ")
+        return await self.create_customer(
+            tenant_id,
+            first_name,
+            last_name.strip(),
+            phone=cleaned_phone,
+        )
+
     async def list_customers(
         self, tenant_id: uuid.UUID, *, active: bool | None = None
     ) -> list[Customer]:

@@ -18,6 +18,12 @@ pydantic-settings = "^2.3.0"
 pyjwt = "^2.8.0"
 pwdlib = { extras = ["argon2"], version = "^0.2.0" }
 redis = "^5.0"
+# The delivery pin resolver's worker. Asyncio-native, so a job IS the existing async
+# resolver — no event loop per task. Reuses REDIS_URL; adds no broker of its own.
+arq = "^0.26.0"
+langchain-openai = "^1.4.1"
+python-multipart = "^0.0.32"
+segno = "^1.6.6"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.2.0"
@@ -53,3 +59,16 @@ plugins = ["pydantic.mypy"]
 mypy_path = "src"
 packages = ["restaurante"]
 strict = true
+
+# LangChain no está tipado con el rigor del resto del código: `bind_tools` devuelve un
+# `Runnable` genérico y los mensajes llevan atributos que sólo existen según el proveedor.
+#
+# Esta excepción es aceptable SÓLO porque el paquete está confinado: `ConversationEngine`
+# toma y devuelve dataclasses nuestras, y ni un tipo de LangChain sube a `application/` o
+# `domain/`. Lo comprueba `tests/modules/assistant/test_llm_confinement.py`. Si esa prueba
+# se cae, esto deja de ser una excepción acotada y pasa a ser un agujero en un código
+# estricto: arréglese el confinamiento, no se amplíe este override.
+[[tool.mypy.overrides]]
+module = "restaurante.modules.assistant.infrastructure.llm.*"
+disallow_untyped_calls = false
+warn_return_any = false

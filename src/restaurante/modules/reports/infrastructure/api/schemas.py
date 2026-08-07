@@ -188,3 +188,28 @@ class ZReportResponse(BaseModel):
     top_product_variant_id: uuid.UUID | None = None
     top_product_name: str | None = None
     top_product_units: int
+
+
+class ShiftOrderRowResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    channel: str
+    status: str
+    total: Decimal
+    created_at: datetime | None = None
+
+
+class ShiftDeliveryRowResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    order_id: uuid.UUID
+    delivery_status: str
+    address_text: str
+    neighborhood: str | None = None
+
+
+class ShiftRecordResponse(BaseModel):
+    """A closed shift's operational record (orders + deliveries) — companion to the Z."""
+
+    model_config = ConfigDict(from_attributes=True)
+    orders: list[ShiftOrderRowResponse]
+    deliveries: list[ShiftDeliveryRowResponse]

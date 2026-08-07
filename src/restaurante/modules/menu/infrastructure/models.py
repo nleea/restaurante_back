@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import uuid
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     ForeignKey,
     Integer,
@@ -20,6 +22,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Uuid,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from restaurante.shared.database import (
@@ -147,6 +150,26 @@ class ProductVariantModel(Base, TenantScopedMixin):
     )
     name: Mapped[str | None] = mapped_column(String(150), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
+class MenuAppearanceModel(Base, TenantScopedMixin, TimestampMixin):
+    """The public-carta appearance config, one row per tenant.
+
+    The whole config lives as a single JSONB document (`config`) mirroring the
+    frontend ``MenuAppearanceConfig`` contract, so the storefront reads exactly the
+    object the admin editor writes. `tenant_id` is UNIQUE (upsert target). JSONB on
+    PostgreSQL, plain JSON under SQLite so the test suite stays backend-agnostic.
+    """
+
+    __tablename__ = "menu_appearance"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", name="uq_menu_appearance_tenant"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    config: Mapped[dict[str, Any]] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"), nullable=False
+    )
 
 
 class ProductVariantOptionModel(Base, TenantScopedMixin):

@@ -14,9 +14,11 @@ from typing import Any
 from restaurante.modules.recipes.domain.entities import (
     ALLERGEN_KEYS,
     Ingredient,
+    IngredientCost,
     RecipeCard,
     RecipeDetail,
     RecipeItem,
+    VariantMissingRecipe,
 )
 from restaurante.modules.recipes.domain.ports import RecipesRepository
 from restaurante.shared.domain.errors import (
@@ -45,6 +47,14 @@ class RecipesService:
                 f"Unidad de medida no encontrada: {unit_of_measure_id}"
             )
 
+    async def _require_station(
+        self, tenant_id: uuid.UUID, kitchen_station_id: uuid.UUID
+    ) -> None:
+        if not await self._repo.station_exists(tenant_id, kitchen_station_id):
+            raise NotFoundError(
+                f"Estación de cocina no encontrada: {kitchen_station_id}"
+            )
+
     async def _require_variant(
         self, tenant_id: uuid.UUID, product_variant_id: uuid.UUID
     ) -> None:
@@ -69,14 +79,20 @@ class RecipesService:
         unit_of_measure_id: uuid.UUID,
         *,
         category: str | None = None,
+        is_customer_removable: bool = True,
+        default_station_id: uuid.UUID | None = None,
     ) -> Ingredient:
         await self._require_unit(unit_of_measure_id)
+        if default_station_id is not None:
+            await self._require_station(tenant_id, default_station_id)
         return await self._repo.create_ingredient(
             Ingredient(
                 tenant_id=tenant_id,
                 name=name,
                 category=category,
                 unit_of_measure_id=unit_of_measure_id,
+                is_customer_removable=is_customer_removable,
+                default_station_id=default_station_id,
             )
         )
 
@@ -95,6 +111,10 @@ class RecipesService:
     ) -> Ingredient:
         if fields.get("unit_of_measure_id") is not None:
             await self._require_unit(fields["unit_of_measure_id"])
+        # `.get() is not None` on purpose: an explicit null clears the station, and
+        # clearing must not be validated against a station that no longer exists.
+        if fields.get("default_station_id") is not None:
+            await self._require_station(tenant_id, fields["default_station_id"])
         updated = await self._repo.update_ingredient(tenant_id, ingredient_id, fields)
         if updated is None:
             raise NotFoundError(f"Insumo no encontrado: {ingredient_id}")
@@ -111,6 +131,23 @@ class RecipesService:
             raise NotFoundError(f"Insumo no encontrado: {ingredient_id}")
         return updated
 
+    async def list_ingredient_costs(
+        self, tenant_id: uuid.UUID
+    ) -> list[IngredientCost]:
+        """Per-ingredient unit cost for live menu costing.
+
+        Every ingredient gets an entry; ``unit_cost`` is the moving-average of its
+        purchases, or ``None`` when it has no purchase history — unavailable, never
+        zero, so the food-cost meter can show an honest partial state.
+        """
+        costs = await self._repo.ingredient_unit_costs(tenant_id)
+        ingredients = await self._repo.list_ingredients(tenant_id)
+        return [
+            IngredientCost(ingredient_id=i.id, unit_cost=costs.get(i.id))
+            for i in ingredients
+            if i.id is not None
+        ]
+
     # --- Recipe items (BOM) ------------------------------------------------
     async def add_recipe_item(
         self,
@@ -119,10 +156,13 @@ class RecipesService:
         ingredient_id: uuid.UUID,
         quantity: Decimal,
         unit_of_measure_id: uuid.UUID,
+        station_id: uuid.UUID | None = None,
     ) -> RecipeItem:
         await self._require_variant(tenant_id, product_variant_id)
         await self._require_ingredient(tenant_id, ingredient_id)
         await self._require_unit(unit_of_measure_id)
+        if station_id is not None:
+            await self._require_station(tenant_id, station_id)
         if quantity <= 0:
             raise ValidationError("La cantidad de la receta debe ser positiva.")
         if await self._repo.recipe_item_exists(
@@ -138,6 +178,7 @@ class RecipesService:
                 ingredient_id=ingredient_id,
                 quantity=quantity,
                 unit_of_measure_id=unit_of_measure_id,
+                station_id=station_id,
             )
         )
 
@@ -156,6 +197,9 @@ class RecipesService:
                 raise ValidationError("La cantidad de la receta debe ser positiva.")
         if fields.get("unit_of_measure_id") is not None:
             await self._require_unit(fields["unit_of_measure_id"])
+        # Null explícito vuelve al default del insumo, así que sólo se valida con valor.
+        if fields.get("station_id") is not None:
+            await self._require_station(tenant_id, fields["station_id"])
         updated = await self._repo.update_recipe_item(tenant_id, item_id, fields)
         if updated is None:
             raise NotFoundError(f"Línea de receta no encontrada: {item_id}")
@@ -164,8 +208,26 @@ class RecipesService:
     async def delete_recipe_item(
         self, tenant_id: uuid.UUID, item_id: uuid.UUID
     ) -> None:
-        await self._require_recipe_item(tenant_id, item_id)
+        item = await self._require_recipe_item(tenant_id, item_id)
+        # Delete-last guard: keep the invariant (active ⇒ ≥1 recipe item) from being
+        # broken after activation. Removing the last item of an active variant is
+        # blocked; deactivate it first. Non-last items, or items of an inactive
+        # variant, delete freely.
+        if await self._repo.variant_is_active(tenant_id, item.product_variant_id):
+            remaining = await self._repo.count_recipe_items(
+                tenant_id, item.product_variant_id
+            )
+            if remaining <= 1:
+                raise ValidationError(
+                    "Desactiva la variante antes de quitar su última receta."
+                )
         await self._repo.delete_recipe_item(tenant_id, item_id)
+
+    async def list_variants_missing_recipe(
+        self, tenant_id: uuid.UUID
+    ) -> list[VariantMissingRecipe]:
+        """Active (sellable) variants that still have zero recipe items."""
+        return await self._repo.list_active_variants_without_recipe(tenant_id)
 
     # --- Recipe details (steps + allergens) ---------------------------------
     async def upsert_recipe_detail(

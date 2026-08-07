@@ -205,6 +205,67 @@ async def test_movements_and_non_positive_422(client: AsyncClient) -> None:
     assert len(movements.json()) == 1
 
 
+async def test_movement_roundtrips_created_at_and_category(client: AsyncClient) -> None:
+    await _assign_role("admin")
+    headers = await _login(client)
+    branch_id = await _create_branch()
+    employee_id = await _create_employee(branch_id)
+    session_id = await _open_session(client, headers, branch_id, employee_id)
+
+    resp = await client.post(
+        f"/cash/sessions/{session_id}/movements",
+        headers=headers,
+        json={
+            "type": "in",
+            "concept": "sale",
+            "amount": "20000",
+            "method": "cash",
+            "category": "sale",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["category"] == "sale"
+    assert body["created_at"] is not None
+
+
+async def test_movement_category_defaults_to_other(client: AsyncClient) -> None:
+    await _assign_role("admin")
+    headers = await _login(client)
+    branch_id = await _create_branch()
+    employee_id = await _create_employee(branch_id)
+    session_id = await _open_session(client, headers, branch_id, employee_id)
+
+    resp = await client.post(
+        f"/cash/sessions/{session_id}/movements",
+        headers=headers,
+        json={"type": "in", "concept": "sale", "amount": "20000", "method": "cash"},
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["category"] == "other"
+
+
+async def test_movement_invalid_category_422(client: AsyncClient) -> None:
+    await _assign_role("admin")
+    headers = await _login(client)
+    branch_id = await _create_branch()
+    employee_id = await _create_employee(branch_id)
+    session_id = await _open_session(client, headers, branch_id, employee_id)
+
+    resp = await client.post(
+        f"/cash/sessions/{session_id}/movements",
+        headers=headers,
+        json={
+            "type": "in",
+            "concept": "sale",
+            "amount": "20000",
+            "method": "cash",
+            "category": "bogus",
+        },
+    )
+    assert resp.status_code == 422
+
+
 # --- Close / reconciliation -------------------------------------------------
 async def test_close_reconciliation_cash_only(client: AsyncClient) -> None:
     await _assign_role("admin")
@@ -265,6 +326,80 @@ async def test_movement_on_closed_session_conflicts(client: AsyncClient) -> None
         json={"type": "in", "concept": "sale", "amount": "1000", "method": "cash"},
     )
     assert resp.status_code == 409
+
+
+async def test_close_persists_observations(client: AsyncClient) -> None:
+    await _assign_role("admin")
+    headers = await _login(client)
+    branch_id = await _create_branch()
+    employee_id = await _create_employee(branch_id)
+    session_id = await _open_session(client, headers, branch_id, employee_id)
+
+    close = await client.post(
+        f"/cash/sessions/{session_id}/close",
+        headers=headers,
+        json={
+            "closed_by_employee_id": str(employee_id),
+            "counted_amount": "100000",
+            "notes": "todo cuadra",
+            "incident": True,
+            "incident_note": "faltante de 2000",
+        },
+    )
+    assert close.status_code == 200, close.text
+    body = close.json()
+    assert body["notes"] == "todo cuadra"
+    assert body["incident"] is True
+    assert body["incident_note"] == "faltante de 2000"
+
+    # persisted: fetched again returns the same observations
+    fetched = await client.get(f"/cash/sessions/{session_id}", headers=headers)
+    assert fetched.status_code == 200
+    fbody = fetched.json()
+    assert fbody["notes"] == "todo cuadra"
+    assert fbody["incident"] is True
+    assert fbody["incident_note"] == "faltante de 2000"
+
+
+# --- Live shift summary -----------------------------------------------------
+async def test_shift_summary_shape_with_cash_read(client: AsyncClient) -> None:
+    await _assign_role("admin")
+    headers = await _login(client)
+    branch_id = await _create_branch()
+    employee_id = await _create_employee(branch_id)
+    session_id = await _open_session(client, headers, branch_id, employee_id)
+
+    await client.post(
+        f"/cash/sessions/{session_id}/movements",
+        headers=headers,
+        json={
+            "type": "out",
+            "concept": "withdrawal",
+            "amount": "15000",
+            "method": "cash",
+            "category": "withdrawal",
+        },
+    )
+
+    resp = await client.get(
+        f"/cash/sessions/{session_id}/summary", headers=headers
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["cash_session_id"] == session_id
+    assert body["status"] == "open"
+    assert Decimal(body["sales_total"]) == Decimal("0")
+    assert body["tickets"] == 0
+    assert isinstance(body["channels"], list)
+    assert isinstance(body["payments"], list)
+    # expected cash = opening (100000) - cash withdrawal (15000) = 85000
+    assert Decimal(body["expected_cash"]) == Decimal("85000")
+
+    open_summary = await client.get(
+        f"/cash/branches/{branch_id}/open-session/summary", headers=headers
+    )
+    assert open_summary.status_code == 200
+    assert open_summary.json()["cash_session_id"] == session_id
 
 
 # --- RBAC -------------------------------------------------------------------

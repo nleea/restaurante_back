@@ -19,6 +19,12 @@ class EmployeeResponse(BaseModel):
     role_id: uuid.UUID
     hired_at: date | None = None
     is_active: bool
+    #: A dónde le escribe el sistema. Hoy sólo lo usan las alertas escaladas por WhatsApp.
+    phone: str | None = None
+    #: Si quiere recibir ese aviso. Elección explícita, distinta de tener el permiso.
+    receives_alerts: bool = False
+    #: El chat de WhatsApp emparejado. `None` = no se le puede escribir todavía.
+    whatsapp_contact_id: uuid.UUID | None = None
 
 
 class PlannedShiftResponse(BaseModel):
@@ -83,6 +89,22 @@ class CreateEmployeeRequest(BaseModel):
     person_id: uuid.UUID
     user_id: uuid.UUID
     role_id: uuid.UUID
+
+
+class UpdateEmployeePhoneRequest(BaseModel):
+    """El teléfono de contacto del empleado. Vacío lo borra.
+
+    Se acepta como lo escriba una persona (`+57 300 111 2233`); el servicio lo normaliza
+    antes de guardarlo, porque es lo que después se compara con lo que manda WhatsApp.
+    """
+
+    phone: str | None = Field(default=None, max_length=30)
+
+
+class UpdateAlertSubscriptionRequest(BaseModel):
+    """Si a esta persona se le escribe por WhatsApp cuando una alerta lleva rato sin tomar."""
+
+    receives_alerts: bool
 
 
 class UpdateEmployeeRoleRequest(BaseModel):

@@ -10,7 +10,11 @@ import uuid
 from fastapi import APIRouter, Depends, Response, status
 
 from restaurante.modules.identity.infrastructure.api.deps import require_permission
-from restaurante.modules.menu.infrastructure.api.deps import MenuServiceDep, TenantDep
+from restaurante.modules.menu.infrastructure.api.deps import (
+    AppearanceServiceDep,
+    MenuServiceDep,
+    TenantDep,
+)
 from restaurante.modules.menu.infrastructure.api.schemas import (
     AddonResponse,
     CategoryResponse,
@@ -20,6 +24,7 @@ from restaurante.modules.menu.infrastructure.api.schemas import (
     CreateProductVariantRequest,
     CreateVariantGroupRequest,
     CreateVariantOptionRequest,
+    MenuAppearanceConfigSchema,
     ProductPriceResponse,
     ProductResponse,
     ProductVariantResponse,
@@ -438,3 +443,30 @@ async def detach_addon(
 ) -> Response:
     await service.detach_addon(tenant_id, product_id, addon_id)
     return Response(status_code=_NO_CONTENT)
+
+
+# --- Appearance (public carta config) --------------------------------------
+@router.get(
+    "/appearance", response_model=MenuAppearanceConfigSchema, dependencies=[_READ]
+)
+async def get_appearance(
+    service: AppearanceServiceDep, tenant_id: TenantDep
+) -> MenuAppearanceConfigSchema:
+    """The saved public-carta appearance, or a computed default if never saved."""
+    config = await service.get_appearance(tenant_id)
+    return MenuAppearanceConfigSchema.model_validate(config)
+
+
+@router.put(
+    "/appearance", response_model=MenuAppearanceConfigSchema, dependencies=[_WRITE]
+)
+async def save_appearance(
+    payload: MenuAppearanceConfigSchema,
+    service: AppearanceServiceDep,
+    tenant_id: TenantDep,
+) -> MenuAppearanceConfigSchema:
+    """Validate + upsert the tenant's single appearance row; returns the saved config."""
+    saved = await service.save_appearance(
+        tenant_id, payload.model_dump(by_alias=True)
+    )
+    return MenuAppearanceConfigSchema.model_validate(saved)

@@ -18,6 +18,7 @@ from restaurante.modules.recipes.infrastructure.api.deps import (
 from restaurante.modules.recipes.infrastructure.api.schemas import (
     AddRecipeItemRequest,
     CreateIngredientRequest,
+    IngredientCostResponse,
     IngredientResponse,
     RecipeCardResponse,
     RecipeDetailResponse,
@@ -25,6 +26,7 @@ from restaurante.modules.recipes.infrastructure.api.schemas import (
     UpdateIngredientRequest,
     UpdateRecipeItemRequest,
     UpsertRecipeDetailRequest,
+    VariantMissingRecipeResponse,
 )
 
 router = APIRouter(prefix="/recipes", tags=["recipes"])
@@ -45,7 +47,12 @@ async def create_ingredient(
     payload: CreateIngredientRequest, service: RecipesServiceDep, tenant_id: TenantDep
 ) -> IngredientResponse:
     ingredient = await service.create_ingredient(
-        tenant_id, payload.name, payload.unit_of_measure_id, category=payload.category
+        tenant_id,
+        payload.name,
+        payload.unit_of_measure_id,
+        category=payload.category,
+        is_customer_removable=payload.is_customer_removable,
+        default_station_id=payload.default_station_id,
     )
     return IngredientResponse.model_validate(ingredient, from_attributes=True)
 
@@ -101,7 +108,38 @@ async def deactivate_ingredient(
     return IngredientResponse.model_validate(ingredient, from_attributes=True)
 
 
+@router.get(
+    "/ingredient-costs",
+    response_model=list[IngredientCostResponse],
+    dependencies=[_READ],
+)
+async def list_ingredient_costs(
+    service: RecipesServiceDep, tenant_id: TenantDep
+) -> list[IngredientCostResponse]:
+    """Per-ingredient unit cost (moving-average of purchases) for live menu
+    costing; `unit_cost` is null when an ingredient has no purchase history."""
+    costs = await service.list_ingredient_costs(tenant_id)
+    return [
+        IngredientCostResponse.model_validate(c, from_attributes=True) for c in costs
+    ]
+
+
 # --- Recipe items (BOM) -----------------------------------------------------
+@router.get(
+    "/variants/missing-recipe",
+    response_model=list[VariantMissingRecipeResponse],
+    dependencies=[_READ],
+)
+async def list_variants_missing_recipe(
+    service: RecipesServiceDep, tenant_id: TenantDep
+) -> list[VariantMissingRecipeResponse]:
+    variants = await service.list_variants_missing_recipe(tenant_id)
+    return [
+        VariantMissingRecipeResponse.model_validate(v, from_attributes=True)
+        for v in variants
+    ]
+
+
 @router.post(
     "/variants/{variant_id}/items",
     response_model=RecipeItemResponse,
@@ -120,6 +158,7 @@ async def add_recipe_item(
         payload.ingredient_id,
         payload.quantity,
         payload.unit_of_measure_id,
+        station_id=payload.station_id,
     )
     return RecipeItemResponse.model_validate(item, from_attributes=True)
 

@@ -31,6 +31,10 @@ class CustomersRepository(Protocol):
         self, tenant_id: uuid.UUID, customer_id: uuid.UUID
     ) -> Customer | None: ...
 
+    async def get_customer_by_phone(
+        self, tenant_id: uuid.UUID, phone: str
+    ) -> Customer | None: ...
+
     async def list_customers(
         self, tenant_id: uuid.UUID, *, active: bool | None = None
     ) -> list[Customer]: ...

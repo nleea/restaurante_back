@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Protocol
@@ -15,7 +16,10 @@ from restaurante.modules.orders.domain.entities import (
     OrderItem,
     OrderItemAddon,
     OrderPayment,
+    OrderPaymentClaim,
+    OrderRefund,
     ReceiptPrint,
+    TableBill,
 )
 
 
@@ -27,6 +31,46 @@ class KitchenRouting(Protocol):
     """
 
     async def route_order(self, tenant_id: uuid.UUID, order_id: uuid.UUID) -> None: ...
+
+
+class DeliveryQuoteGate(Protocol):
+    """Outbound port: ¿está el domicilio de este pedido en condiciones de cobrarse?
+
+    Existe porque un domicilio sin cotizar tiene un `total` que TODAVÍA NO incluye el domicilio.
+    Verificar el pago en ese instante cobra de menos, manda la comida a cocina, y la diferencia
+    aparece en la puerta — con el pedido ya entregado y sin nada que hacer.
+
+    Puerto y no un import de `delivery` por lo de siempre: cobrar tiene que poder ocurrir sin el
+    módulo de domicilios montado. Sin adaptador enchufado, la puerta está abierta y el
+    comportamiento es exactamente el de antes.
+    """
+
+    async def quote_blocker(
+        self, tenant_id: uuid.UUID, order_id: uuid.UUID
+    ) -> str | None:
+        """Motivo por el que este pedido no puede cobrarse aún, o None si puede.
+
+        Devuelve una frase para una persona, no un código: quien la lee está delante del
+        cliente y necesita saber qué decirle.
+        """
+        ...
+
+
+class PaymentClaimNotifier(Protocol):
+    """Outbound port: decirle al cliente en qué quedó el comprobante que mandó.
+
+    Puerto y no un import de messaging por lo de siempre: el cobro tiene que poder ocurrir con
+    WhatsApp completamente ausente. Sin adaptador enchufado, resolver un comprobante no avisa a
+    nadie y todo lo demás funciona igual.
+    """
+
+    async def notify_payment_claim(
+        self,
+        tenant_id: uuid.UUID,
+        order_id: uuid.UUID,
+        status: str,
+        reason: str | None,
+    ) -> None: ...
 
 
 class DeliveryDispatch(Protocol):
@@ -41,6 +85,21 @@ class DeliveryDispatch(Protocol):
         self, tenant_id: uuid.UUID, order_id: uuid.UUID
     ) -> None: ...
 
+    async def release_delivery_for_order(
+        self, tenant_id: uuid.UUID, order_id: uuid.UUID
+    ) -> None:
+        """Suelta la entrega de un pedido que deja de existir. NUNCA levanta.
+
+        Es la misma obligación que liberar la mesa: la comanda se acaba, así que todo lo que
+        tenía cogido hay que soltarlo. Una entrega abandonada no puede llegar nunca a cocina
+        —su comanda ya no está— y bloquea el cierre de caja de su turno sin salida honesta.
+
+        SÓLO suelta la entrega que nunca salió del local. Una que ya va con un domiciliario no
+        se toca: alguien salió con esa comida y el desenlace es suyo. La implementación es
+        idempotente — un pedido sin entrega, o con una ya resuelta, no cambia nada.
+        """
+        ...
+
 
 class OrdersRepository(Protocol):
     # --- Reference existence checks ----------------------------------------
@@ -52,7 +111,15 @@ class OrdersRepository(Protocol):
         self, tenant_id: uuid.UUID, employee_id: uuid.UUID
     ) -> bool: ...
 
+    async def customer_exists(
+        self, tenant_id: uuid.UUID, customer_id: uuid.UUID
+    ) -> bool: ...
+
     async def variant_exists(
+        self, tenant_id: uuid.UUID, product_variant_id: uuid.UUID
+    ) -> bool: ...
+
+    async def variant_has_recipe(
         self, tenant_id: uuid.UUID, product_variant_id: uuid.UUID
     ) -> bool: ...
 
@@ -75,8 +142,106 @@ class OrdersRepository(Protocol):
         self, tenant_id: uuid.UUID, table_id: uuid.UUID, fields: dict[str, Any]
     ) -> DiningTable | None: ...
 
+    async def tenant_slug(self, tenant_id: uuid.UUID) -> str | None:
+        """El subdominio del negocio. Es la mitad de la dirección que va impresa en el QR."""
+        ...
+
+    async def branch_code(
+        self, tenant_id: uuid.UUID, branch_id: uuid.UUID
+    ) -> str | None:
+        """El código con el que la sede se direcciona en la URL pública."""
+        ...
+
+    async def count_open_orders_on_table(
+        self,
+        tenant_id: uuid.UUID,
+        table_id: uuid.UUID,
+        exclude_order_id: uuid.UUID | None = None,
+    ) -> int:
+        """Cuántas comandas siguen ABIERTAS en esa mesa, sin contar `exclude_order_id`.
+
+        Existe para poder liberar la mesa sólo cuando no queda nadie comiendo. Se excluye la
+        comanda en curso porque quien pregunta está a mitad de cerrarla o cancelarla y su propia
+        fila puede seguir viéndose abierta dentro de la misma transacción.
+        """
+        ...
+
+    # --- Table bills -------------------------------------------------------
+    def unit_of_work(self) -> AbstractAsyncContextManager[None]:
+        """Agrupa varias escrituras en UNA transacción: o quedan todas, o no queda ninguna.
+
+        Existe para el cobro de una cuenta de mesa, que son N pagos, N movimientos de caja, N
+        descuentos de inventario y N cierres. Dejar la mitad hechos —una comanda cerrada y otra
+        cobrada sin cerrar— es el peor resultado posible de esa operación.
+        """
+        ...
+
+    async def create_table_bill(self, bill: TableBill) -> TableBill: ...
+
+    async def get_table_bill(
+        self, tenant_id: uuid.UUID, bill_id: uuid.UUID
+    ) -> TableBill | None: ...
+
+    async def claim_orders_for_bill(
+        self, tenant_id: uuid.UUID, bill_id: uuid.UUID, order_ids: list[uuid.UUID]
+    ) -> int:
+        """Reclama esas comandas para la cuenta y devuelve cuántas se llevó de verdad.
+
+        Sólo se lleva las que están ABIERTAS y SIN cuenta. Comparar el recuento con lo pedido
+        es lo que convierte la carrera entre dos cajeros en un error legible, en vez de en una
+        cuenta a la que le falta gente sin decirlo.
+        """
+        ...
+
+    async def list_bill_members(
+        self, tenant_id: uuid.UUID, bill_id: uuid.UUID
+    ) -> list[Order]:
+        """Los miembros en el orden en que se reparte: `created_at`, y `id` para desempatar."""
+        ...
+
+    async def release_bill_orders(
+        self, tenant_id: uuid.UUID, bill_id: uuid.UUID
+    ) -> None: ...
+
+    async def delete_table_bill(
+        self, tenant_id: uuid.UUID, bill_id: uuid.UUID
+    ) -> None: ...
+
+    async def settle_table_bill(
+        self, tenant_id: uuid.UUID, bill_id: uuid.UUID, total: Decimal
+    ) -> None: ...
+
+    async def bill_receipt_data(
+        self, tenant_id: uuid.UUID, bill_id: uuid.UUID
+    ) -> dict[str, Any] | None:
+        """Todo lo que la tirilla necesita, ya junto. Ver la implementación."""
+        ...
+
+    async def bill_has_receipt(
+        self, tenant_id: uuid.UUID, bill_id: uuid.UUID
+    ) -> bool: ...
+
     # --- Orders ------------------------------------------------------------
     async def create_order(self, order: Order) -> Order: ...
+
+    async def set_edit_token(
+        self,
+        tenant_id: uuid.UUID,
+        order_id: uuid.UUID,
+        token: str,
+        expires_at: datetime,
+    ) -> None:
+        """Acuña el enlace con el que el cliente edita ESTE pedido."""
+        ...
+
+    async def get_order_by_edit_token(self, token: str) -> Order | None:
+        """El pedido detrás de un token, sin filtrar por tenant.
+
+        No lleva `tenant_id` a propósito: el token es global y quien lo resuelve todavía no
+        sabe de quién es. Comprobar que el pedido pertenece al tenant de la petición es
+        trabajo de quien llama — igual que ya hace `resolve_store_token`.
+        """
+        ...
 
     async def get_order(
         self, tenant_id: uuid.UUID, order_id: uuid.UUID
@@ -89,6 +254,8 @@ class OrdersRepository(Protocol):
         branch_id: uuid.UUID | None = None,
         status: str | None = None,
         dining_table_id: uuid.UUID | None = None,
+        open_session_only: bool = False,
+        whatsapp_contact_id: uuid.UUID | None = None,
     ) -> list[Order]: ...
 
     async def update_order(
@@ -167,6 +334,86 @@ class OrdersRepository(Protocol):
     async def list_payments(
         self, tenant_id: uuid.UUID, order_id: uuid.UUID
     ) -> list[OrderPayment]: ...
+
+    async def payments_total(
+        self, tenant_id: uuid.UUID, order_id: uuid.UUID
+    ) -> Decimal: ...
+
+    # --- Payment claims (una declaración del cliente, NUNCA un pago) -------
+    async def create_payment_claim(
+        self, claim: OrderPaymentClaim
+    ) -> OrderPaymentClaim: ...
+
+    async def list_payment_claims(
+        self, tenant_id: uuid.UUID, order_id: uuid.UUID
+    ) -> list[OrderPaymentClaim]: ...
+
+    async def count_pending_payment_claims(
+        self, tenant_id: uuid.UUID, order_id: uuid.UUID
+    ) -> int: ...
+
+    async def get_payment_claim(
+        self, tenant_id: uuid.UUID, claim_id: uuid.UUID
+    ) -> OrderPaymentClaim | None: ...
+
+    async def resolve_payment_claims(
+        self,
+        tenant_id: uuid.UUID,
+        order_id: uuid.UUID,
+        *,
+        status: str,
+        employee_id: uuid.UUID | None,
+        reason: str | None = None,
+        claim_id: uuid.UUID | None = None,
+    ) -> list[OrderPaymentClaim]:
+        """Resuelve las pendientes del pedido (o una concreta) y devuelve las que cambiaron."""
+        ...
+
+    # --- Refunds -----------------------------------------------------------
+    async def create_refund(self, refund: OrderRefund) -> OrderRefund: ...
+
+    async def get_refund(
+        self, tenant_id: uuid.UUID, refund_id: uuid.UUID
+    ) -> OrderRefund | None: ...
+
+    async def refund_for_order(
+        self, tenant_id: uuid.UUID, order_id: uuid.UUID
+    ) -> OrderRefund | None: ...
+
+    async def list_refunds(
+        self,
+        tenant_id: uuid.UUID,
+        branch_id: uuid.UUID,
+        *,
+        status: str | None = None,
+    ) -> list[OrderRefund]: ...
+
+    async def resolve_refund(
+        self,
+        tenant_id: uuid.UUID,
+        refund_id: uuid.UUID,
+        *,
+        status: str,
+        employee_id: uuid.UUID,
+        reason: str | None,
+    ) -> OrderRefund | None: ...
+
+    async def register_refund_movement(self, refund: OrderRefund) -> None:
+        """Movimiento de caja `out` por el monto devuelto, con el método ORIGINAL.
+
+        Nunca efectivo salvo que el pago original lo fuera: el arqueo solo cuenta `cash`, y
+        registrar ahí una devolución por transferencia haría que esperara menos plata en el
+        cajón de la que hay.
+        """
+        ...
+
+    async def create_order_credit(
+        self,
+        tenant_id: uuid.UUID,
+        customer_id: uuid.UUID,
+        amount: Decimal,
+        order_id: uuid.UUID,
+    ) -> None: ...
 
     # --- Inventory deduction (orders ↔ recipes ↔ inventory) ----------------
     async def consume_inventory_for_order(

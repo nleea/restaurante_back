@@ -49,6 +49,17 @@ class CashRepository(Protocol):
         self, tenant_id: uuid.UUID, session_id: uuid.UUID
     ) -> list[CashMovement]: ...
 
+    async def unresolved_deliveries(
+        self, tenant_id: uuid.UUID, cash_session_id: uuid.UUID
+    ) -> list[tuple[uuid.UUID, str]]:
+        """Entregas del turno que aún no tienen desenlace: (delivery_id, estado).
+
+        Resuelta es `delivered` o `not_delivered`. Todo lo demás —`pending`, `assigned`,
+        `in_transit`— significa que puede haber efectivo en el bolsillo de alguien o comida
+        en la calle sin desenlace escrito, y eso no puede cerrar un turno.
+        """
+        ...
+
     async def cash_totals(
         self, tenant_id: uuid.UUID, session_id: uuid.UUID
     ) -> tuple[Decimal, Decimal]: ...

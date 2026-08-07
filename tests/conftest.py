@@ -17,6 +17,17 @@ os.environ["ACCESS_TOKEN_EXPIRE_MINUTES"] = "15"
 os.environ["REFRESH_TOKEN_EXPIRE_DAYS"] = "7"
 os.environ["BASE_DOMAIN"] = "api.local"
 os.environ["DEBUG"] = "false"
+# The suite never talks to Redis. The geocoding resolver requires CACHE_BACKEND=redis to
+# behave as specified, so a real `.env` sets it — and without this line that `.env` reaches
+# the tests, which then open a real connection and fail on a shared event loop. What runs the
+# tests must not depend on what a developer has running.
+os.environ["CACHE_BACKEND"] = "memory"
+# The WhatsApp webhook fails closed when no secret is configured, so the suite has to
+# configure one to be able to exercise the accepted path at all.
+os.environ["WHATSAPP_WEBHOOK_SECRET"] = "test-webhook-secret"
+# Sin base pública de la carta, el saludo automático se calla a propósito: un enlace
+# relativo por WhatsApp no es clicable. La suite necesita una para probar el camino bueno.
+os.environ["STOREFRONT_BASE_URL"] = "https://example.test"
 
 import pytest_asyncio  # noqa: E402
 from httpx import ASGITransport, AsyncClient  # noqa: E402
@@ -25,6 +36,7 @@ from sqlalchemy import event  # noqa: E402
 import restaurante.shared.models_registry  # noqa: E402, F401  (registers all tables)
 from restaurante.main import app  # noqa: E402
 from restaurante.modules.identity.infrastructure.models import UserModel  # noqa: E402
+from restaurante.shared.api.prefix import API_PREFIX  # noqa: E402
 from restaurante.shared.cache import get_cache  # noqa: E402
 from restaurante.shared.database import Base, SessionFactory, engine  # noqa: E402
 from restaurante.shared.security.password import Argon2PasswordHasher  # noqa: E402
@@ -94,7 +106,10 @@ async def setup_db() -> None:
 @pytest_asyncio.fixture
 async def client(setup_db: None) -> AsyncClient:
     transport = ASGITransport(app=app)
+    # El prefijo `/api` vive en el base_url y NO en cada test: los tests describen la API
+    # ("/auth/login"), no dónde está montada. httpx une base + ruta, así que mover el
+    # prefijo es esta línea.
     async with AsyncClient(
-        transport=transport, base_url="http://demo.api.local"
+        transport=transport, base_url=f"http://demo.api.local{API_PREFIX}"
     ) as http_client:
         yield http_client
