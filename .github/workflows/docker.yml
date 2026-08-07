@@ -13,7 +13,11 @@ env:
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest
+    # El servidor de destino es arm64, así que la imagen se construye en un runner
+    # arm64 NATIVO (gratis en repos públicos). La alternativa —emular arm64 con QEMU
+    # sobre un runner amd64— compila asyncpg y argon2 interpretados y multiplica el
+    # tiempo del build por diez, para el mismo resultado.
+    runs-on: ubuntu-24.04-arm
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -46,6 +50,10 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
+          # Explícito aunque el runner ya sea arm64: si algún día vuelve a un runner
+          # amd64, el build fallaría en vez de publicar en silencio una imagen que el
+          # servidor no puede arrancar (`exec format error`).
+          platforms: linux/arm64
           tags: |
             ${{ env.DOCKER_USER }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
             ${{ env.DOCKER_USER }}/${{ env.IMAGE_NAME }}:latest
