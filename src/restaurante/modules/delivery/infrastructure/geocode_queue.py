@@ -19,6 +19,16 @@ import logging
 import uuid
 from typing import Any
 
+# Our own queue, not arq's shared default.
+#
+# Both workers point at the same Redis, and arq puts CRON jobs on the queue like any other. On
+# one queue the alerts worker happily pops `sweep_pending_geocodes`, finds no such function,
+# logs `function not found` and DISCARDS it — the sweep that is supposed to guarantee every pin
+# simply doesn't happen that minute, and the only trace is a warning in the other worker's log.
+# It goes both ways: `sweep_alert_rules` dies the same death over here. Separate queues, so each
+# worker only ever sees work it can run.
+DELIVERY_QUEUE = "arq:queue:delivery"
+
 # The jobs the worker runs. Named here because this is the side that says them.
 GEOCODE_DELIVERY_JOB = "geocode_delivery"
 # Quoting an already-pinned delivery. Separate from the geocode job because the trigger is
@@ -56,7 +66,11 @@ class ArqGeocodeQueue:
             arq_connections = importlib.import_module("arq.connections")
             settings = arq_connections.RedisSettings.from_dsn(self._redis_url)
             settings.conn_retries = _CONN_RETRIES
-            self._pool = await arq_connections.create_pool(settings)
+            # Must match the worker's `queue_name`, or every announcement lands on a queue
+            # nobody reads and only the sweep ever resolves anything.
+            self._pool = await arq_connections.create_pool(
+                settings, default_queue_name=DELIVERY_QUEUE
+            )
         return self._pool
 
     async def announce(self, tenant_id: uuid.UUID, delivery_id: uuid.UUID) -> None:

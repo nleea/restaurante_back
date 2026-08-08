@@ -45,6 +45,7 @@ from restaurante.modules.delivery.infrastructure.distance_estimator import (
     HaversineBufferedEstimator,
 )
 from restaurante.modules.delivery.infrastructure.geocode_queue import (
+    DELIVERY_QUEUE,
     GEOCODE_DELIVERY_JOB,
     QUOTE_DELIVERY_JOB,
 )
@@ -239,11 +240,18 @@ class WorkerSettings:
         ),
         cron(
             sweep_pending_quotes,
-            minute=set(range(0, 30, get_settings().geocode_sweep_minute_step)),
+            # 0..59, like the geocode pass. It used to say `range(0, 30, ...)`, which is not a
+            # slower schedule — it is HALF AN HOUR of every hour with no quoting at all: a
+            # delivery pinned at :31 sat unpriced until :00. Quoting is local arithmetic
+            # against no provider, so there is nothing to spare by skipping minutes.
+            minute=set(range(0, 60, get_settings().geocode_sweep_minute_step)),
             second=30,
             unique=True,
         ),
     ]
+
+    # Only this worker's own jobs — see DELIVERY_QUEUE. Must match the announcer's pool.
+    queue_name = DELIVERY_QUEUE
 
     # NOT a tuning knob. The providers' ~1 req/s is a ceiling on the whole system, so the
     # resolver is not horizontally scalable and its concurrency is pinned here at one. Raising
