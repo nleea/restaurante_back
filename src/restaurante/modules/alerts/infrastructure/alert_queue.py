@@ -19,7 +19,10 @@ import logging
 import uuid
 from typing import Any
 
-from restaurante.modules.alerts.infrastructure.worker import EVALUATE_SUBJECT_JOB
+from restaurante.modules.alerts.infrastructure.worker import (
+    ALERTS_QUEUE,
+    EVALUATE_SUBJECT_JOB,
+)
 
 # Sin reintentos de conexión y con techo de espera: fallar el anuncio es gratis, y hacer
 # esperar cinco segundos a quien registra una salida de inventario contra un Redis muerto
@@ -42,7 +45,10 @@ class ArqAlertQueue:
             arq_connections = importlib.import_module("arq.connections")
             settings = arq_connections.RedisSettings.from_dsn(self._redis_url)
             settings.conn_retries = _CONN_RETRIES
-            self._pool = await arq_connections.create_pool(settings)
+            # Tiene que coincidir con el `queue_name` del worker.
+            self._pool = await arq_connections.create_pool(
+                settings, default_queue_name=ALERTS_QUEUE
+            )
         return self._pool
 
     async def announce(

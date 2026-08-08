@@ -64,6 +64,13 @@ _log = logging.getLogger(__name__)
 #: así los dos lados no pueden separarse en un job encolado para siempre que nadie corre.
 EVALUATE_SUBJECT_JOB = "evaluate_alert_subject"
 
+#: Cola propia, no la compartida de arq. Los dos workers apuntan al mismo Redis y arq encola
+#: los CRON como cualquier otro job: en una sola cola, el worker de domicilios saca
+#: `sweep_alert_rules`, no encuentra la función, escribe `function not found` y lo TIRA. El
+#: barrido de ese ciclo no ocurre y la única huella queda en el log del OTRO worker. Con colas
+#: separadas, cada uno sólo ve trabajo que sabe ejecutar.
+ALERTS_QUEUE = "arq:queue:alerts"
+
 #: Cada cuántos minutos barre. Cinco es la conjetura de partida: el stock bajo no necesita
 #: segundos. Una sucursal muda discutiblemente sí, y por eso esto acabará siendo por regla.
 SWEEP_MINUTE_STEP = 5
@@ -148,6 +155,10 @@ class WorkerSettings:
             unique=True,
         )
     ]
+
+    # Sólo los jobs de este worker — ver ALERTS_QUEUE. Tiene que coincidir con el pool del
+    # anunciante, o los anuncios caen en una cola que nadie lee.
+    queue_name = ALERTS_QUEUE
 
     # A diferencia del worker de domicilios, aquí no hay límite externo que respetar: las
     # evaluaciones son consultas a nuestra propia base. Se deja bajo igualmente para que una
