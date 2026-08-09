@@ -68,6 +68,68 @@ async def store_conversation_media(
         return None
 
     key = f"whatsapp-media/{tenant_id}/{conversation_id}/{uuid.uuid4().hex}{extension}"
+    return await _upload(key, mimetype, data, storage=storage, now=now, client=client)
+
+
+async def store_status_media(
+    tenant_id: uuid.UUID,
+    mimetype: str,
+    data: bytes,
+    *,
+    storage: StorageGateway,
+    now: datetime | None = None,
+    client: httpx.AsyncClient | None = None,
+) -> str | None:
+    """La imagen de un estado. Mismo camino presignado, otro prefijo de clave.
+
+    Prefijo propio (`whatsapp-status/`) y no el de las conversaciones porque la clave tiene que
+    poder atribuir un objeto suelto del bucket sin consultar la base, y una imagen de estado no
+    pertenece a ninguna conversación. No lleva el id del estado: se sube ANTES de que el estado
+    exista —el dueño elige la foto y luego guarda—, y meter un id que todavía no hay obligaría a un
+    guardado en dos pasos que puede quedarse a medias.
+
+    **Es la imagen menos sensible de las tres** que pasan por este módulo. El comprobante y el
+    multimedia entrante son de una persona y llegan a un chat privado; ésta el dueño la publica a
+    propósito. Se le da el mismo trato —URL pública y opaca— porque el mecanismo es el mismo, y
+    conviene notar que aquí la opacidad sobra en vez de faltar.
+    """
+    return await _upload(
+        f"whatsapp-status/{tenant_id}/{uuid.uuid4().hex}",
+        mimetype,
+        data,
+        storage=storage,
+        now=now,
+        client=client,
+        key_needs_extension=True,
+    )
+
+
+async def _upload(
+    key: str,
+    mimetype: str,
+    data: bytes,
+    *,
+    storage: StorageGateway,
+    now: datetime | None,
+    client: httpx.AsyncClient | None,
+    key_needs_extension: bool = False,
+) -> str | None:
+    """El PUT firmado. Extraído porque a partir de aquí lo usan dos sitios."""
+    if key_needs_extension:
+        extension = STORABLE_MIMES.get(mimetype)
+        if extension is None:
+            logger.warning("Archivo con tipo no soportado: %s", mimetype)
+            return None
+        if not fits(data):
+            logger.warning("Archivo fuera de tope (%s bytes)", len(data))
+            return None
+        if not storage.is_configured:
+            logger.warning(
+                "El almacenamiento de archivos no está configurado; el archivo no se guarda."
+            )
+            return None
+        key = f"{key}{extension}"
+
     upload_url = storage.presign_put(key, now=now or datetime.now(UTC))
     owns_client = client is None
     client = client or httpx.AsyncClient(timeout=20.0)

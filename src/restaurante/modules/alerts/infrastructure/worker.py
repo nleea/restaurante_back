@@ -1,16 +1,25 @@
-"""El proceso que vigila. Segundo worker del sistema.
+"""El proceso que vigila y el que publica a su hora. Segundo worker del sistema.
 
     poetry run arq restaurante.modules.alerts.infrastructure.worker.WorkerSettings
 
-**EJECUTA EXACTAMENTE UNO.** No uno por host ni uno por réplica del API: uno. El motivo no es
-el de domicilios —allí es un límite de la API de geocodificación— sino el barrido: dos
-procesos barriendo a la vez evalúan las mismas reglas en paralelo. Eso NO produce alertas
-duplicadas, porque el índice único parcial lo impide; produce trabajo duplicado y, sobre todo,
-carreras al escalar que `mark_escalated` tiene que absorber en cada pasada. `unique=True` en el
-cron lo evita dentro de un proceso y no puede evitarlo entre dos, y por eso "cuántos workers"
-es un requisito escrito aquí y no un ajuste en un fichero.
+**EJECUTA EXACTAMENTE UNO.** No uno por host ni uno por réplica del API: uno. Y ahora hay DOS
+motivos, de gravedad muy distinta — el segundo llegó con los estados de WhatsApp y es el que
+importa antes de escalar este Deployment:
 
-Dos caminos, y la diferencia es todo el diseño:
+1. **Alertas: trabajo duplicado.** Dos procesos barriendo evalúan las mismas reglas en paralelo.
+   Eso NO produce alertas duplicadas —el índice único parcial lo impide— pero sí trabajo de más
+   y carreras al escalar que `mark_escalated` tiene que absorber en cada pasada.
+2. **Estados: PUBLICACIONES duplicadas.** Dos procesos publicando la misma franja sacarían el
+   mismo estado dos veces al teléfono de cada contacto. Lo que de verdad lo impide es el reclamo
+   de emisión en la base (`try_claim_emission`, una fila por estado/fecha/minuto), igual que el
+   índice del punto 1. Pero el daño de que ese reclamo fallara no es trabajo de más: es volumen
+   de salida duplicado sobre un puente no oficial, que es lo que hace que baneen el número — y si
+   el número cae, cae el canal entero.
+
+`unique=True` en los crones lo evita dentro de un proceso y **no puede evitarlo entre dos**, y por
+eso "cuántos workers" es un requisito escrito aquí y no un ajuste en un fichero.
+
+Tres crones/caminos, y la diferencia entre los dos primeros es todo el diseño de las alertas:
 
 - `evaluate_subject` — un job, anunciado tras un movimiento de stock. Es la LATENCIA: la
   alerta llega en segundos en vez de en el próximo barrido. Puede perderse, y no pasa nada.
@@ -18,10 +27,20 @@ Dos caminos, y la diferencia es todo el diseño:
   la GARANTÍA, y es autoritativa: **quita el camino del job entero y el sistema sigue siendo
   correcto**, sólo que más lento. Encuentra lo que el job no encontró — Redis caído, el job
   murió, un camino de código que se olvidó de anunciar.
+- `sweep_due_statuses` — publica los estados cuya franja venció. **Cron puro: no tiene camino de
+  job, y no es un olvido.** Un horario es intrínsecamente temporal, así que no hay ningún hecho
+  que anunciar; se cae la mitad complicada del patrón anterior y queda sólo la parte autoritativa.
+
+Vive aquí y no en un worker propio por tres razones, en orden de peso: este proceso ya habla
+WhatsApp (`whatsapp_escalation` importa el bridge y el guard, así que no se abre ninguna dirección
+de acoplamiento nueva); su invariante de "exactamente uno" es literalmente lo que necesita un
+programador de tareas; y un tercer worker cuesta tercera cola, tercer Deployment y tercer par
+`manual-config`/`manual-secret` en k8s, todo para un cron.
 
 El worker corre sin contexto de tenant y por eso ve los de todos. Es lo que necesita un
 vigilante; ver sólo "los activos recientemente" es exactamente cómo se pierde la sucursal que
-lleva dos días muda.
+lleva dos días muda. Los estados lo necesitan por lo mismo, y por eso
+`list_active_statuses_everywhere` existe con ese nombre.
 """
 
 from __future__ import annotations
@@ -53,6 +72,16 @@ from restaurante.modules.alerts.infrastructure.repositories import (
 )
 from restaurante.modules.alerts.infrastructure.whatsapp_escalation import (
     WhatsAppEscalationChannel,
+)
+from restaurante.modules.messaging.application.use_cases.statuses import StatusService
+from restaurante.modules.messaging.infrastructure.repositories import (
+    SqlAlchemyMessagingRepository,
+)
+from restaurante.modules.messaging.infrastructure.whatsapp.bridge import (
+    BridgeWhatsAppGateway,
+)
+from restaurante.modules.messaging.infrastructure.whatsapp.guard import (
+    GuardedWhatsAppGateway,
 )
 from restaurante.shared.config import get_settings
 from restaurante.shared.database import SessionFactory
@@ -141,6 +170,56 @@ async def sweep_alert_rules(ctx: dict[Any, Any]) -> str:
     )
 
 
+def _build_statuses(session: Any) -> StatusService:
+    """El servicio de estados sobre una sesión. Mismo cableado que el API, a propósito.
+
+    Siempre el gateway GUARDADO, nunca el bridge a pelo: aunque un estado no pueda iniciar una
+    conversación (no aterriza en ningún chat), el guard es también donde vive la comprobación de que
+    el puente esté configurado y contactable, y eso tiene que ser lo mismo para los tres verbos.
+    """
+    settings = get_settings()
+    repo = SqlAlchemyMessagingRepository(session)
+    bridge = BridgeWhatsAppGateway(
+        base_url=settings.whatsapp_bridge_base_url,
+        api_key=settings.whatsapp_bridge_api_key,
+        timeout_seconds=settings.whatsapp_bridge_timeout_seconds,
+    )
+    return StatusService(
+        repo,
+        GuardedWhatsAppGateway(bridge, repo),
+        recipient_cap=settings.whatsapp_status_recipient_cap,
+        inactivity_days=settings.whatsapp_status_inactivity_days,
+        grace_minutes=settings.whatsapp_status_grace_minutes,
+    )
+
+
+async def sweep_due_statuses(ctx: dict[Any, Any]) -> str:
+    """Publica los estados de WhatsApp cuya franja venció. Cron puro, sin camino de job.
+
+    A diferencia de las alertas, aquí NO hay vía rápida ni anuncio por Redis, y no es un olvido: un
+    horario es intrínsecamente temporal, así que no hay ningún hecho que anunciar. Se cae la mitad
+    complicada del patrón y queda sólo el barrido, que ya era la parte autoritativa.
+    """
+    async with SessionFactory() as session:
+        outcome = await _build_statuses(session).sweep()
+    if outcome.published or outcome.failed or outcome.skipped_late or outcome.skipped_empty:
+        _log.info(
+            "Estados: %s considerados, %s publicados, %s fallidos, %s tarde, %s sin audiencia, "
+            "%s ya hechos",
+            outcome.statuses_considered,
+            outcome.published,
+            outcome.failed,
+            outcome.skipped_late,
+            outcome.skipped_empty,
+            outcome.already_done,
+        )
+    return (
+        f"considered={outcome.statuses_considered} published={outcome.published} "
+        f"failed={outcome.failed} late={outcome.skipped_late} "
+        f"empty={outcome.skipped_empty} done={outcome.already_done}"
+    )
+
+
 class WorkerSettings:
     """El worker de alertas. `arq <la ruta de esta clase>`. Uno solo — ver el módulo."""
 
@@ -153,7 +232,19 @@ class WorkerSettings:
             # Por defecto de arq, dicho en voz alta porque importa: impide que el barrido se
             # solape consigo mismo DENTRO de este proceso. Entre dos procesos no puede.
             unique=True,
-        )
+        ),
+        cron(
+            sweep_due_statuses,
+            # CADA minuto, no cada cinco: una franja se programa a una hora concreta y el dueño
+            # espera que salga a esa hora. La ventana de gracia absorbe el retraso de un proceso
+            # caído, no el de un cron perezoso.
+            minute=set(range(0, 60)),
+            second=10,
+            # Aquí `unique` importa MÁS que arriba: dos pasadas solapadas en alertas duplican
+            # trabajo, y en estados duplicarían PUBLICACIONES. Lo que de verdad lo impide es el
+            # reclamo de emisión en la base; esto es la primera de las dos defensas.
+            unique=True,
+        ),
     ]
 
     # Sólo los jobs de este worker — ver ALERTS_QUEUE. Tiene que coincidir con el pool del

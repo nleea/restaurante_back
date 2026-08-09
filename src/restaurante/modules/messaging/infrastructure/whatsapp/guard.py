@@ -83,6 +83,44 @@ class GuardedWhatsAppGateway:
             session, to_phone, data, mimetype=mimetype, filename=filename, caption=caption
         )
 
+    async def publish_status(
+        self,
+        session: WhatsAppSession,
+        jids: list[str],
+        *,
+        status_type: str,
+        content: str,
+        bg_color: str | None = None,
+        font: int | None = None,
+        caption: str | None = None,
+    ) -> str | None:
+        """Passthrough, y hay que explicar por qué no es un olvido.
+
+        Este decorador protege UNA invariante: no escribirle a quien no nos escribió. Un estado
+        no le escribe a nadie — no aterriza en ningún chat, sale en la pestaña de novedades y lo
+        abre quien quiere. Así que no hay conversación que se inicie, y no hay a quién preguntarle
+        `is_reachable`: no hay un destinatario, hay una lista.
+
+        La invariante **sí** se conserva, y se conserva aguas arriba: `jids` sólo puede venir de
+        `resolve_audience`, que sólo acepta candidatos con un mensaje entrante en esa sede. La
+        diferencia con `send_text` es dónde vive la garantía, no si existe — aquí es por
+        construcción de la audiencia, allí es por comprobación en el envío.
+
+        Se pasa por el guard igualmente, y no por el bridge a pelo, por lo mismo que todo lo demás:
+        que la raíz de composición sólo inyecte esto significa que la comprobación de alcanzabilidad
+        del PUENTE (configurado / contactable) es la misma para los tres verbos, y que nadie pueda
+        publicar un estado esquivando el único sitio por donde sale todo.
+        """
+        return await self._inner.publish_status(
+            session,
+            jids,
+            status_type=status_type,
+            content=content,
+            bg_color=bg_color,
+            font=font,
+            caption=caption,
+        )
+
     async def fetch_media(
         self,
         session: WhatsAppSession,

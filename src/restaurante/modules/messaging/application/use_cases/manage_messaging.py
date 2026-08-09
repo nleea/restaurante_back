@@ -535,6 +535,34 @@ class MessagingService:
             tenant_id, branch_id, include_closed=include_closed
         )
 
+    async def set_status_opt_out(
+        self,
+        tenant_id: uuid.UUID,
+        branch_id: uuid.UUID,
+        conversation_id: uuid.UUID,
+        opted_out: bool,
+    ) -> None:
+        """Marca o desmarca "este contacto no quiere estados", desde su hilo.
+
+        Se entra por la CONVERSACIÓN y no por el contacto a propósito: la petición llega en el chat,
+        y quien la lee es quien lo está atendiendo. Obligar a cambiar de pantalla —y de permiso—
+        para cumplir algo que acabas de leer es cómo se consigue que no se cumpla.
+
+        La marca, en cambio, es del CONTACTO y aplica a todas las sedes del negocio: "no me manden
+        más" se le pide al negocio, y hacer que la persona lo repita sucursal por sucursal es cómo
+        se consigue que bloquee el número en vez de volver a pedirlo.
+
+        No toca el estado de la conversación, ni la saca de la bandeja, ni impide responderle.
+        """
+        conversation = await self._require_conversation(
+            tenant_id, branch_id, conversation_id
+        )
+        updated = await self._repo.set_status_opt_out(
+            tenant_id, conversation.whatsapp_contact_id, opted_out
+        )
+        if not updated:
+            raise NotFoundError("El contacto de la conversación no existe.")
+
     async def get_thread(
         self,
         tenant_id: uuid.UUID,

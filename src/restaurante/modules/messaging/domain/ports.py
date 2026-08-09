@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
-from typing import Protocol
+from typing import Any, Protocol
 
 from restaurante.modules.messaging.domain.entities import (
     AutoreplySettings,
+    StatusPublication,
     WhatsAppContact,
     WhatsAppConversation,
     WhatsAppMessage,
     WhatsAppSession,
+    WhatsAppStatus,
 )
+from restaurante.modules.messaging.domain.status_audience import StatusCandidate
+from restaurante.modules.messaging.domain.status_schedule import StatusSlot
 
 
 @dataclass
@@ -112,6 +116,98 @@ class MessagingRepository(Protocol):
     ) -> list[OrderLineSummary]:
         """Qué compró, para poder contárselo. Sin ítems cancelados: ya no los tiene."""
         ...
+
+    # --- Estados programados -------------------------------------------------
+    async def list_statuses(
+        self, tenant_id: uuid.UUID, branch_id: uuid.UUID
+    ) -> list[WhatsAppStatus]:
+        """Los estados de una sede, con sus franjas, del más nuevo al más viejo."""
+        ...
+
+    async def get_status(
+        self, tenant_id: uuid.UUID, branch_id: uuid.UUID, status_id: uuid.UUID
+    ) -> WhatsAppStatus | None: ...
+
+    async def create_status(
+        self,
+        tenant_id: uuid.UUID,
+        branch_id: uuid.UUID,
+        *,
+        status_type: str,
+        content: str,
+        bg_color: str | None,
+        font: int | None,
+        caption: str | None,
+        media_url: str | None,
+        created_by: uuid.UUID | None,
+    ) -> uuid.UUID: ...
+
+    async def update_status(
+        self,
+        tenant_id: uuid.UUID,
+        branch_id: uuid.UUID,
+        status_id: uuid.UUID,
+        **values: Any,
+    ) -> bool: ...
+
+    async def delete_status(
+        self, tenant_id: uuid.UUID, branch_id: uuid.UUID, status_id: uuid.UUID
+    ) -> bool: ...
+
+    async def replace_slots(
+        self,
+        tenant_id: uuid.UUID,
+        branch_id: uuid.UUID,
+        status_id: uuid.UUID,
+        slots: list[StatusSlot],
+    ) -> None:
+        """Borra TODAS las franjas y reinserta, como `operating_hours`.
+
+        Está en el puerto con este nombre —y no `save_slots`— porque el borrar-y-reinsertar no es
+        un detalle del adaptador: es lo que obliga a que la clave de emisión no lleve el id de la
+        fila.
+        """
+        ...
+
+    async def list_active_statuses_everywhere(self) -> list[WhatsAppStatus]:
+        """TODOS los estados encendidos de TODOS los tenants. Sólo para el barrido del worker."""
+        ...
+
+    async def list_status_candidates(
+        self, tenant_id: uuid.UUID, branch_id: uuid.UUID
+    ) -> list[StatusCandidate]:
+        """Los contactos que escribieron a ESA sede, con su recencia y su opt-out como hechos.
+
+        No filtra: trae. Filtrar aquí haría imposible contar cada exclusión, y esas cuentas son un
+        requisito — sin ellas una audiencia truncada se presenta como completa.
+        """
+        ...
+
+    async def set_status_opt_out(
+        self, tenant_id: uuid.UUID, contact_id: uuid.UUID, opted_out: bool
+    ) -> bool: ...
+
+    async def record_publication(
+        self,
+        tenant_id: uuid.UUID,
+        branch_id: uuid.UUID,
+        status_id: uuid.UUID,
+        *,
+        fired_for_date: date,
+        minute: int,
+        state: str,
+        addressed_count: int = 0,
+        excluded_no_number: int = 0,
+        excluded_opted_out: int = 0,
+        excluded_inactive: int = 0,
+        excluded_by_cap: int = 0,
+        late_by_minutes: int = 0,
+        provider_message_id: str | None = None,
+    ) -> None: ...
+
+    async def list_publications(
+        self, tenant_id: uuid.UUID, branch_id: uuid.UUID, status_id: uuid.UUID
+    ) -> list[StatusPublication]: ...
 
     # --- Sessions ------------------------------------------------------------
     async def get_session(
@@ -476,6 +572,39 @@ class WhatsAppGateway(Protocol):
         El puerto sigue sin saber de plantillas ni de botones. Un archivo no es una plantilla: es
         el mismo verbo de siempre con otro cuerpo, y cualquier puente —incluida la API oficial—
         sabe hacerlo.
+        """
+        ...
+
+    async def publish_status(
+        self,
+        session: WhatsAppSession,
+        jids: list[str],
+        *,
+        status_type: str,
+        content: str,
+        bg_color: str | None = None,
+        font: int | None = None,
+        caption: str | None = None,
+    ) -> str | None:
+        """Publica un estado dirigido a `jids` y devuelve el id que el proveedor acepte.
+
+        **Es el primer verbo de salida que no es un mensaje**, y por eso ensancha el puerto sin
+        romper la propiedad de arriba. Un estado no aterriza en ninguna conversación: sale en la
+        pestaña de novedades, lo abre quien quiere, no espera respuesta y caduca a las 24 horas. No
+        inicia una conversación con nadie, que es la invariante que este módulo protege.
+
+        Lo que **no** hace es comprobar destinatario por destinatario. La invariante se conserva
+        aguas arriba, por construcción de la audiencia: `jids` sólo puede venir de contactos con un
+        entrante en esa sede. Aquí no hay a quién preguntarle `is_reachable`, porque no hay un
+        destinatario — hay una lista.
+
+        `content` es el texto de la tarjeta o la URL de la imagen. `bg_color` y `font` son
+        obligatorios cuando `status_type` es texto: el proveedor devuelve 400 sin ellos. Se validan
+        al GUARDAR el estado, no aquí, porque aquí ya no hay nadie mirando.
+
+        Devuelve `None` cuando el proveedor acepta sin dar id: es información que no tenemos, y
+        fabricarla sería peor que no tenerla. Levanta `MessageDeliveryError` si rechaza o no se
+        puede contactar.
         """
         ...
 

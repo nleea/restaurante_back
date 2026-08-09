@@ -11,9 +11,10 @@ and `claim_conversation` (atomic claiming without a lock table).
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any, cast
 
+from sqlalchemy import delete as sql_delete
 from sqlalchemy import func, select
 from sqlalchemy import update as sql_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -33,10 +34,12 @@ from restaurante.modules.messaging.domain.entities import (
     AutoreplySettings,
     FaqEntry,
     QuickReply,
+    StatusPublication,
     WhatsAppContact,
     WhatsAppConversation,
     WhatsAppMessage,
     WhatsAppSession,
+    WhatsAppStatus,
 )
 from restaurante.modules.messaging.domain.ports import (
     BusinessIdentity,
@@ -45,6 +48,8 @@ from restaurante.modules.messaging.domain.ports import (
     OrderLineSummary,
     UnsettledOrder,
 )
+from restaurante.modules.messaging.domain.status_audience import StatusCandidate
+from restaurante.modules.messaging.domain.status_schedule import StatusSlot
 from restaurante.modules.messaging.infrastructure.models import (
     OPEN_CONVERSATION_STATUSES,
     WhatsAppAutoreplySettingsModel,
@@ -53,6 +58,9 @@ from restaurante.modules.messaging.infrastructure.models import (
     WhatsAppMessageModel,
     WhatsAppOutboundEmissionModel,
     WhatsAppSessionModel,
+    WhatsAppStatusModel,
+    WhatsAppStatusPublicationModel,
+    WhatsAppStatusSlotModel,
     emission_key,
 )
 from restaurante.modules.orders.infrastructure.models import (
@@ -82,6 +90,15 @@ def _session(m: WhatsAppSessionModel) -> WhatsAppSession:
     )
 
 
+def _as_utc(moment: datetime) -> datetime:
+    """SQLite devuelve datetimes ingenuos; normalizarlos o la resta revienta.
+
+    El mismo apaño que ya hace `last_activity_at` en línea, extraído porque a partir de aquí lo
+    necesitan dos sitios y un `if` duplicado es cómo uno de los dos se olvida.
+    """
+    return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+
+
 def _contact(m: WhatsAppContactModel) -> WhatsAppContact:
     return WhatsAppContact(
         id=m.id,
@@ -91,6 +108,7 @@ def _contact(m: WhatsAppContactModel) -> WhatsAppContact:
         updated_at=m.updated_at,
         name=m.name,
         address=m.address,
+        status_opt_out=m.status_opt_out,
     )
 
 
@@ -175,6 +193,25 @@ def _conversation(m: WhatsAppConversationModel) -> WhatsAppConversation:
         closed_at=m.closed_at,
         store_token=m.store_token,
         store_token_expires_at=m.store_token_expires_at,
+    )
+
+
+def _status(m: WhatsAppStatusModel, slots: list[StatusSlot]) -> WhatsAppStatus:
+    return WhatsAppStatus(
+        id=m.id,
+        tenant_id=m.tenant_id,
+        branch_id=m.branch_id,
+        type=m.type,
+        content=m.content,
+        created_at=m.created_at,
+        updated_at=m.updated_at,
+        slots=slots,
+        bg_color=m.bg_color,
+        font=m.font,
+        caption=m.caption,
+        media_url=m.media_url,
+        active=m.active,
+        created_by=m.created_by,
     )
 
 
@@ -374,6 +411,92 @@ class SqlAlchemyMessagingRepository:
             .order_by(func.max(WhatsAppMessageModel.sent_at).desc())
         )
         return [(r[0], r[1], r[2]) for r in (await self._session.execute(stmt)).all()]
+
+    async def list_status_candidates(
+        self, tenant_id: uuid.UUID, branch_id: uuid.UUID
+    ) -> list[StatusCandidate]:
+        """Los candidatos a ver un estado publicado DESDE esta sede, del más reciente al más
+        antiguo.
+
+        Hermana de `list_contactable` y con la misma columna vertebral —contacto → conversación de
+        esta sede → mensaje entrante— pero con tres diferencias que importan:
+
+        **Es por SEDE, y eso es lo contrario de `is_reachable`.** Aquel es deliberadamente por
+        negocio ("escribirle a cualquier sucursal te hace contactable"), y para un mensaje directo
+        es correcto. Para un estado es falso: un estado se publica DESDE un número, y quien escribió
+        al número de otra sede no lo tiene guardado, así que su teléfono no le va a enseñar esta
+        historia pase lo que pase. Incluirlo sería volumen de salida sin audiencia posible.
+
+        **No filtra el opt-out ni la inactividad: los TRAE como hechos.** Filtrarlos aquí haría
+        imposible contarlos, y las cuentas por separado son un requisito — una pantalla que no
+        puede decir *por qué* la audiencia bajó de 340 a 200 presenta una lista truncada como si
+        fuera completa. La exclusión y el conteo ocurren en un solo sitio,
+        `domain/status_audience.py`, que es puro y se prueba sin base.
+
+        **La recencia se mide sólo sobre mensajes ENTRANTES.** Una respuesta que mandamos ayer no
+        dice nada de si esa persona sigue ahí; por eso el `MAX` va sobre los del contacto y no sobre
+        los del hilo.
+        """
+        stmt = (
+            select(
+                WhatsAppContactModel.phone,
+                func.max(WhatsAppMessageModel.sent_at).label("last_inbound_at"),
+                WhatsAppContactModel.status_opt_out,
+            )
+            .join(
+                WhatsAppConversationModel,
+                WhatsAppConversationModel.whatsapp_contact_id
+                == WhatsAppContactModel.id,
+            )
+            .join(
+                WhatsAppMessageModel,
+                WhatsAppMessageModel.whatsapp_conversation_id
+                == WhatsAppConversationModel.id,
+            )
+            .where(
+                WhatsAppContactModel.tenant_id == tenant_id,
+                WhatsAppConversationModel.branch_id == branch_id,
+                WhatsAppMessageModel.sender_type == "contact",
+            )
+            .group_by(
+                WhatsAppContactModel.id,
+                WhatsAppContactModel.phone,
+                WhatsAppContactModel.status_opt_out,
+            )
+            # El orden es un REQUISITO, no una comodidad: es lo que hace que, cuando el tope tenga
+            # que dejar gente fuera, se queden los que escribieron hace menos. Cortar una lista sin
+            # orden deja un subconjunto arbitrario, que es elegir al azar quién ve el menú del día.
+            .order_by(func.max(WhatsAppMessageModel.sent_at).desc())
+        )
+        rows = (await self._session.execute(stmt)).all()
+        return [
+            StatusCandidate(
+                address=row[0],
+                last_inbound_at=_as_utc(row[1]),
+                opted_out=bool(row[2]),
+            )
+            for row in rows
+        ]
+
+    async def set_status_opt_out(
+        self, tenant_id: uuid.UUID, contact_id: uuid.UUID, opted_out: bool
+    ) -> bool:
+        """Marca o desmarca "no me manden estados". Devuelve si el contacto existía.
+
+        No toca nada más: ni el estado de la conversación, ni la bandeja, ni el historial. Es lo que
+        lo separa de borrar el contacto, que era la única forma de sacar a alguien de la lista antes
+        de que existiera la columna — y se llevaba su hilo por delante.
+        """
+        result = await self._session.execute(
+            sql_update(WhatsAppContactModel)
+            .where(
+                WhatsAppContactModel.id == contact_id,
+                WhatsAppContactModel.tenant_id == tenant_id,
+            )
+            .values(status_opt_out=opted_out)
+        )
+        await self._session.commit()
+        return cast(CursorResult[Any], result).rowcount > 0
 
     async def is_reachable(self, tenant_id: uuid.UUID, phone: str) -> bool:
         """A contact exists for the phone AND has written at least once.
@@ -1323,3 +1446,279 @@ class SqlAlchemyMessagingRepository:
             )
         ).scalar_one_or_none()
         return _message(row) if row else None
+
+    # --- Estados programados -------------------------------------------------
+    async def create_status(
+        self,
+        tenant_id: uuid.UUID,
+        branch_id: uuid.UUID,
+        *,
+        status_type: str,
+        content: str,
+        bg_color: str | None,
+        font: int | None,
+        caption: str | None,
+        media_url: str | None,
+        created_by: uuid.UUID | None,
+    ) -> uuid.UUID:
+        model = WhatsAppStatusModel(
+            tenant_id=tenant_id,
+            branch_id=branch_id,
+            type=status_type,
+            content=content,
+            bg_color=bg_color,
+            font=font,
+            caption=caption,
+            media_url=media_url,
+            created_by=created_by,
+        )
+        self._session.add(model)
+        await self._session.commit()
+        await self._session.refresh(model)
+        return model.id
+
+    async def update_status(
+        self,
+        tenant_id: uuid.UUID,
+        branch_id: uuid.UUID,
+        status_id: uuid.UUID,
+        **values: Any,
+    ) -> bool:
+        result = await self._session.execute(
+            sql_update(WhatsAppStatusModel)
+            .where(
+                WhatsAppStatusModel.id == status_id,
+                WhatsAppStatusModel.tenant_id == tenant_id,
+                WhatsAppStatusModel.branch_id == branch_id,
+            )
+            .values(**values)
+        )
+        await self._session.commit()
+        return cast(CursorResult[Any], result).rowcount > 0
+
+    async def delete_status(
+        self, tenant_id: uuid.UUID, branch_id: uuid.UUID, status_id: uuid.UUID
+    ) -> bool:
+        result = await self._session.execute(
+            sql_delete(WhatsAppStatusModel).where(
+                WhatsAppStatusModel.id == status_id,
+                WhatsAppStatusModel.tenant_id == tenant_id,
+                WhatsAppStatusModel.branch_id == branch_id,
+            )
+        )
+        await self._session.commit()
+        return cast(CursorResult[Any], result).rowcount > 0
+
+    async def replace_slots(
+        self,
+        tenant_id: uuid.UUID,
+        branch_id: uuid.UUID,
+        status_id: uuid.UUID,
+        slots: list[StatusSlot],
+    ) -> None:
+        """Borra todas las franjas y reinserta. Igual que `operating_hours`, y por lo mismo.
+
+        Es lo correcto para un conjunto que se edita como un todo: el dueño no "añade una franja",
+        guarda un horario. Y es **exactamente** lo que obliga a que la clave de emisión no lleve el
+        id de estas filas — cada guardado les da uno nuevo. Ver
+        `domain/status_schedule.emission_detail`.
+        """
+        await self._session.execute(
+            sql_delete(WhatsAppStatusSlotModel).where(
+                WhatsAppStatusSlotModel.whatsapp_status_id == status_id,
+                WhatsAppStatusSlotModel.tenant_id == tenant_id,
+            )
+        )
+        for slot in slots:
+            self._session.add(
+                WhatsAppStatusSlotModel(
+                    tenant_id=tenant_id,
+                    branch_id=branch_id,
+                    whatsapp_status_id=status_id,
+                    weekday=slot.weekday,
+                    on_date=slot.on_date,
+                    minute=slot.minute,
+                )
+            )
+        await self._session.commit()
+
+    async def get_status(
+        self, tenant_id: uuid.UUID, branch_id: uuid.UUID, status_id: uuid.UUID
+    ) -> WhatsAppStatus | None:
+        model = (
+            await self._session.execute(
+                select(WhatsAppStatusModel).where(
+                    WhatsAppStatusModel.id == status_id,
+                    WhatsAppStatusModel.tenant_id == tenant_id,
+                    WhatsAppStatusModel.branch_id == branch_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if model is None:
+            return None
+        slots = await self._slots_of(tenant_id, [model.id])
+        return _status(model, slots.get(model.id, []))
+
+    async def list_statuses(
+        self, tenant_id: uuid.UUID, branch_id: uuid.UUID
+    ) -> list[WhatsAppStatus]:
+        models = list(
+            (
+                await self._session.execute(
+                    select(WhatsAppStatusModel)
+                    .where(
+                        WhatsAppStatusModel.tenant_id == tenant_id,
+                        WhatsAppStatusModel.branch_id == branch_id,
+                    )
+                    .order_by(WhatsAppStatusModel.created_at.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        by_status = await self._slots_of(tenant_id, [m.id for m in models])
+        return [_status(m, by_status.get(m.id, [])) for m in models]
+
+    async def _slots_of(
+        self, tenant_id: uuid.UUID, status_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, list[StatusSlot]]:
+        """Las franjas de varios estados en UNA consulta. Sin esto, listar es N+1."""
+        if not status_ids:
+            return {}
+        rows = (
+            await self._session.execute(
+                select(WhatsAppStatusSlotModel)
+                .where(
+                    WhatsAppStatusSlotModel.tenant_id == tenant_id,
+                    WhatsAppStatusSlotModel.whatsapp_status_id.in_(status_ids),
+                )
+                .order_by(
+                    WhatsAppStatusSlotModel.weekday, WhatsAppStatusSlotModel.minute
+                )
+            )
+        ).scalars()
+        grouped: dict[uuid.UUID, list[StatusSlot]] = {}
+        for row in rows:
+            grouped.setdefault(row.whatsapp_status_id, []).append(
+                StatusSlot(
+                    minute=row.minute, weekday=row.weekday, on_date=row.on_date
+                )
+            )
+        return grouped
+
+    async def list_active_statuses_everywhere(self) -> list[WhatsAppStatus]:
+        """TODOS los estados encendidos, de TODOS los tenants. Sólo para el barrido.
+
+        `skip_tenant_filter` va puesto como defensa, no por necesidad: el filtro automático es un
+        no-op cuando no hay tenant en contexto (`shared/tenancy/filtering.py:41`), que es la
+        situación
+        normal del worker. Lo que ataja es el caso en que un contexto se cuele —un import que lo
+        fija,
+        una prueba que comparte proceso—, porque el modo de fallo entonces es que el barrido
+        publique
+        sólo los de un tenant **sin dar ningún error**.
+
+        Igual que el barrido de alertas, esto ve todos los tenants a propósito: un vigilante que
+        sólo
+        ve uno no vigila.
+        """
+        session = self._session
+        models = list(
+            (
+                await session.execute(
+                    select(WhatsAppStatusModel)
+                    .where(WhatsAppStatusModel.active.is_(True))
+                    .execution_options(skip_tenant_filter=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not models:
+            return []
+        rows = (
+            await session.execute(
+                select(WhatsAppStatusSlotModel)
+                .where(
+                    WhatsAppStatusSlotModel.whatsapp_status_id.in_(
+                        [m.id for m in models]
+                    )
+                )
+                .execution_options(skip_tenant_filter=True)
+            )
+        ).scalars()
+        grouped: dict[uuid.UUID, list[StatusSlot]] = {}
+        for row in rows:
+            grouped.setdefault(row.whatsapp_status_id, []).append(
+                StatusSlot(minute=row.minute, weekday=row.weekday, on_date=row.on_date)
+            )
+        return [_status(m, grouped.get(m.id, [])) for m in models]
+
+    async def record_publication(
+        self,
+        tenant_id: uuid.UUID,
+        branch_id: uuid.UUID,
+        status_id: uuid.UUID,
+        *,
+        fired_for_date: date,
+        minute: int,
+        state: str,
+        addressed_count: int = 0,
+        excluded_no_number: int = 0,
+        excluded_opted_out: int = 0,
+        excluded_inactive: int = 0,
+        excluded_by_cap: int = 0,
+        late_by_minutes: int = 0,
+        provider_message_id: str | None = None,
+    ) -> None:
+        self._session.add(
+            WhatsAppStatusPublicationModel(
+                tenant_id=tenant_id,
+                branch_id=branch_id,
+                whatsapp_status_id=status_id,
+                fired_for_date=fired_for_date,
+                minute=minute,
+                state=state,
+                addressed_count=addressed_count,
+                excluded_no_number=excluded_no_number,
+                excluded_opted_out=excluded_opted_out,
+                excluded_inactive=excluded_inactive,
+                excluded_by_cap=excluded_by_cap,
+                late_by_minutes=late_by_minutes,
+                provider_message_id=provider_message_id,
+            )
+        )
+        await self._session.commit()
+
+    async def list_publications(
+        self, tenant_id: uuid.UUID, branch_id: uuid.UUID, status_id: uuid.UUID
+    ) -> list[StatusPublication]:
+        rows = (
+            await self._session.execute(
+                select(WhatsAppStatusPublicationModel)
+                .where(
+                    WhatsAppStatusPublicationModel.tenant_id == tenant_id,
+                    WhatsAppStatusPublicationModel.branch_id == branch_id,
+                    WhatsAppStatusPublicationModel.whatsapp_status_id == status_id,
+                )
+                .order_by(WhatsAppStatusPublicationModel.created_at.desc())
+            )
+        ).scalars()
+        return [
+            StatusPublication(
+                id=r.id,
+                whatsapp_status_id=r.whatsapp_status_id,
+                fired_for_date=r.fired_for_date,
+                minute=r.minute,
+                state=r.state,
+                created_at=r.created_at,
+                addressed_count=r.addressed_count,
+                excluded_no_number=r.excluded_no_number,
+                excluded_opted_out=r.excluded_opted_out,
+                excluded_inactive=r.excluded_inactive,
+                excluded_by_cap=r.excluded_by_cap,
+                late_by_minutes=r.late_by_minutes,
+                provider_message_id=r.provider_message_id,
+            )
+            for r in rows
+        ]

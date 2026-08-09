@@ -20,6 +20,7 @@ from restaurante.modules.messaging.application.use_cases.autoreply import (
 from restaurante.modules.messaging.application.use_cases.manage_messaging import (
     MessagingService,
 )
+from restaurante.modules.messaging.application.use_cases.statuses import StatusService
 from restaurante.modules.messaging.domain.ports import (
     MessagingRepository,
     WhatsAppGateway,
@@ -137,3 +138,26 @@ def get_messaging_service(session: SessionDep) -> MessagingService:
 
 
 MessagingServiceDep = Annotated[MessagingService, Depends(get_messaging_service)]
+
+
+def get_status_service(session: SessionDep) -> StatusService:
+    """El servicio de estados. Mismo cableado que `_build_statuses` del worker, a propósito.
+
+    Si el API y el worker construyeran el servicio distinto, la audiencia que la pantalla promete y
+    la que se publica podrían no coincidir — y el dueño no tendría forma de saber cuál es la buena.
+    Los tres ajustes de riesgo (tope, ventana, gracia) se leen del mismo sitio en los dos lados.
+    """
+    settings = get_settings()
+    repo = SqlAlchemyMessagingRepository(session)
+    return StatusService(
+        repo,
+        # Siempre el guardado. Un estado no puede iniciar una conversación —no aterriza en ningún
+        # chat— pero el guard es además donde se comprueba que el puente exista, y eso vale igual.
+        build_whatsapp_gateway(repo),
+        recipient_cap=settings.whatsapp_status_recipient_cap,
+        inactivity_days=settings.whatsapp_status_inactivity_days,
+        grace_minutes=settings.whatsapp_status_grace_minutes,
+    )
+
+
+StatusServiceDep = Annotated[StatusService, Depends(get_status_service)]
