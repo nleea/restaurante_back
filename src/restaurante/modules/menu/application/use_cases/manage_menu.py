@@ -15,6 +15,7 @@ from typing import Any
 from restaurante.modules.menu.domain.entities import (
     Addon,
     Category,
+    OrderableProduct,
     Product,
     ProductPrice,
     ProductVariant,
@@ -387,3 +388,14 @@ class MenuService:
         self, tenant_id: uuid.UUID, product_id: uuid.UUID, addon_id: uuid.UUID
     ) -> None:
         await self._repo.detach_addon(tenant_id, product_id, addon_id)
+
+    async def list_orderable(
+        self, tenant_id: uuid.UUID, branch_id: uuid.UUID
+    ) -> list[OrderableProduct]:
+        """Qué se puede pedir hoy en esa sede.
+
+        Es una lectura para PEDIR, no para administrar: filtra a lo vendible y trae el precio ya
+        compuesto, mientras que `list_products` devuelve el catálogo tal cual para el editor. Dos
+        lecturas con dos propósitos, y mezclarlas sería obligar a una de las dos a mentir.
+        """
+        return await self._repo.list_orderable(tenant_id, branch_id)

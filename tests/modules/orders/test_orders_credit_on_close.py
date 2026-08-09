@@ -35,6 +35,7 @@ from restaurante.shared.database import SessionFactory
 from restaurante.shared.tenancy.models import BranchModel, TenantModel
 from tests.conftest import TEST_EMAIL, TEST_PASSWORD
 from tests.modules._cash import seed_open_cash_session
+from tests.modules._menu import price_variant_for_branch
 
 
 async def _demo_ids() -> tuple[uuid.UUID, uuid.UUID]:
@@ -284,6 +285,7 @@ async def test_close_fully_paid_order_ok(client: AsyncClient) -> None:
     branch_id = await _create_branch()
     employee_id = await _create_employee(branch_id)
     variant_id = await _create_variant()
+    await price_variant_for_branch(variant_id, branch_id)
     await _open_cash_session(client, headers, branch_id, employee_id)
     order_id = await _open_order(
         client, headers, branch_id, employee_id, variant_id, unit_price="10000"
@@ -303,6 +305,7 @@ async def test_close_overpaid_order_ok_no_credit(client: AsyncClient) -> None:
     branch_id = await _create_branch()
     employee_id = await _create_employee(branch_id)
     variant_id = await _create_variant()
+    await price_variant_for_branch(variant_id, branch_id)
     await _open_cash_session(client, headers, branch_id, employee_id)
     order_id = await _open_order(
         client, headers, branch_id, employee_id, variant_id, unit_price="10000"
@@ -322,6 +325,7 @@ async def test_close_underpaid_no_customer_rejected(client: AsyncClient) -> None
     branch_id = await _create_branch()
     employee_id = await _create_employee(branch_id)
     variant_id = await _create_variant()
+    await price_variant_for_branch(variant_id, branch_id)
     ingredient_id = await _create_recipe_and_stock(variant_id, branch_id)
     await _open_cash_session(client, headers, branch_id, employee_id)
     order_id = await _open_order(
@@ -355,6 +359,7 @@ async def test_close_underpaid_with_customer_creates_credit(
     branch_id = await _create_branch()
     employee_id = await _create_employee(branch_id)
     variant_id = await _create_variant()
+    await price_variant_for_branch(variant_id, branch_id)
     customer_id = await _create_customer(client, headers)
     await _open_cash_session(client, headers, branch_id, employee_id)
     order_id = await _open_order(
@@ -390,6 +395,7 @@ async def test_close_fully_on_credit_creates_credit_for_total(
     branch_id = await _create_branch()
     employee_id = await _create_employee(branch_id)
     variant_id = await _create_variant()
+    await price_variant_for_branch(variant_id, branch_id)
     customer_id = await _create_customer(client, headers)
     # Opening an order needs an open drawer; the order still closes fully on credit.
     await seed_open_cash_session(branch_id, employee_id)

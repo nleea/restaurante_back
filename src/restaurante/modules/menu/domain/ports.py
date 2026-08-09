@@ -9,6 +9,7 @@ from typing import Any, Protocol
 from restaurante.modules.menu.domain.entities import (
     Addon,
     Category,
+    OrderableProduct,
     Product,
     ProductPrice,
     ProductVariant,
@@ -201,3 +202,13 @@ class MenuRepository(Protocol):
     async def upsert_appearance(
         self, tenant_id: uuid.UUID, config: dict[str, Any]
     ) -> dict[str, Any]: ...
+
+    async def list_orderable(
+        self, tenant_id: uuid.UUID, branch_id: uuid.UUID
+    ) -> list[OrderableProduct]:
+        """Lo pedible en una sede, con el precio de cada variante resuelto. En consultas AGRUPADAS.
+
+        "Agrupadas" es parte del contrato: la razón de existir de este método es que la pantalla de
+        comanda pedía ~81 endpoints para pintar sus mosaicos.
+        """
+        ...

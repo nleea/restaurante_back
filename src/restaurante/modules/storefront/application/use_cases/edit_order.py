@@ -313,8 +313,13 @@ class OrderEditService:
         _refuse_if(order_window(facts))
 
         # 1. Se resuelve TODO contra el catálogo antes de escribir nada. El precio nunca viene
-        #    del cliente: `add_item` lo recibe de quien llama, así que quien llama tiene que
-        #    ser quien lo busca.
+        #    del cliente — y desde `server-prices-order-lines` tampoco lo busca quien llama:
+        #    lo resuelve `add_item`, y aquí se PREGUNTA (`line_price`) para poder anunciarle al
+        #    cliente lo que va a deber antes de escribir. Un solo cálculo, dos usos.
+        #
+        #    El principio de antes ("quien llama tiene que ser quien lo busca") era mejor que
+        #    recibirlo del cliente y aun así produjo tres fórmulas: este camino no sumaba el
+        #    recargo de la variante y el salón sí.
         additions = [await self._price_addition(tenant_id, order, line) for line in command.add]
         edits = [
             await self._price_edit(tenant_id, order, by_id, change)
@@ -407,8 +412,13 @@ class OrderEditService:
         product_id = await self._repo.sellable_variant_product(tenant_id, line.variant_id)
         if product_id is None:
             raise ValidationError("Ese producto ya no está disponible.")
-        unit = await self._repo.product_price(tenant_id, product_id, order.branch_id)
-        unit = unit if unit is not None else Decimal(0)
+        # El MISMO cálculo que hará `add_item` al escribir. No es una comodidad: lo que se anuncia
+        # aquí es lo que el cliente va a deber, y dos fórmulas harían que la que divergiera fuese
+        # justo la que él ve. Además suma el recargo de la variante, que este camino no sumaba.
+        unit = await self._orders.line_price(tenant_id, line.variant_id, order.branch_id)
+        if unit is None:
+            # Se cae el `else Decimal(0)`: un producto sin precio en la sede no se añade gratis.
+            raise ValidationError("Ese producto no tiene precio en esta sede.")
         addons: list[tuple[uuid.UUID, Decimal]] = []
         for addon_id in line.addon_ids:
             price = await self._repo.addon_price(tenant_id, addon_id)
@@ -438,8 +448,12 @@ class OrderEditService:
             )
             if product_id is None:
                 raise ValidationError("Ese producto ya no está disponible.")
-            price = await self._repo.product_price(tenant_id, product_id, order.branch_id)
-            unit_price = price if price is not None else Decimal(0)
+            price = await self._orders.line_price(
+                tenant_id, change.variant_id, order.branch_id
+            )
+            if price is None:
+                raise ValidationError("Ese producto no tiene precio en esta sede.")
+            unit_price = price
             delta += (unit_price - item.unit_price) * item.quantity
 
         if change.quantity is not None:
@@ -476,7 +490,6 @@ class OrderEditService:
             order.id,
             addition.line.variant_id,
             addition.line.quantity,
-            addition.unit_price,
             notes=compose_note(addition.line.removed_ingredients, addition.line.note),
         )
         assert item.id is not None
@@ -487,7 +500,7 @@ class OrderEditService:
         edit = change.change
         if edit.variant_id is not None:
             await self._orders.change_item_variant(
-                tenant_id, edit.item_id, edit.variant_id, change.unit_price
+                tenant_id, edit.item_id, edit.variant_id
             )
         if edit.quantity is not None:
             await self._orders.update_item_quantity(tenant_id, edit.item_id, edit.quantity)

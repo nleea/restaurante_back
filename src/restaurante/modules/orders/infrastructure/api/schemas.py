@@ -142,6 +142,12 @@ class OrderResponse(BaseModel):
     customer_id: uuid.UUID | None = None
     whatsapp_contact_id: uuid.UUID | None = None
     closed_at: datetime | None = None
+    # Las líneas, SÓLO cuando se piden con `?include=items`. Nulo si no.
+    #
+    # Es la clave que convierte pintar un salón de doce mesas en una petición en vez de trece. Y es
+    # UNA clave, no un mecanismo de expansión: un endpoint con un menú de `include` acaba teniendo
+    # una forma distinta por pantalla, que es justo lo que un recurso único debería evitar.
+    items: list[OrderItemResponse] | None = None
 
 
 class OrderItemResponse(BaseModel):
@@ -155,6 +161,11 @@ class OrderItemResponse(BaseModel):
     notes: str | None = None
     # True once the item has been routed to the kitchen (has ≥1 ticket) — pending until then.
     sent: bool = False
+    # Cómo se llama la línea, resuelto por el servidor. Con esto un cliente pinta una comanda entera
+    # sin leer ni un endpoint de menú. `variant_name` es nulo cuando la variante no tiene nombre
+    # propio (el caso "estándar"), y quien lo pinta decide cómo lo dice.
+    product_name: str | None = None
+    variant_name: str | None = None
 
 
 class OrderItemAddonResponse(BaseModel):
@@ -213,8 +224,15 @@ class OpenOrderRequest(BaseModel):
 class AddItemRequest(BaseModel):
     product_variant_id: uuid.UUID
     quantity: int = Field(default=1, gt=0)
-    unit_price: Decimal = Field(ge=0)
     notes: str | None = Field(default=None, max_length=255)
+    # TOLERADO E IGNORADO. Antes el cliente mandaba aquí el precio y el servidor se lo creía;
+    # ahora lo resuelve `add_item`. Se acepta el campo —sin usarlo— por una única razón: permite
+    # desplegar este backend ANTES del frontend. Un cliente viejo sigue funcionando y además
+    # empieza a cobrar bien; al revés (frontend nuevo contra backend viejo) se escribirían ceros.
+    #
+    # **Se borra en cuanto el frontend esté desplegado en todos los tenants.** No hay otra razón
+    # para que exista, y un campo ignorado que se queda acaba pareciendo un campo que funciona.
+    unit_price: Decimal | None = Field(default=None, ge=0, deprecated=True)
 
 
 class UpdateItemQuantityRequest(BaseModel):

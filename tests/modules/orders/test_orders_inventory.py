@@ -29,6 +29,7 @@ from restaurante.shared.database import SessionFactory
 from restaurante.shared.tenancy.models import BranchModel, TenantModel
 from tests.conftest import TEST_EMAIL, TEST_PASSWORD
 from tests.modules._cash import seed_open_cash_session
+from tests.modules._menu import price_variant_for_branch
 
 
 async def _demo_ids() -> tuple[uuid.UUID, uuid.UUID]:
@@ -234,6 +235,7 @@ async def test_close_deducts_recipe_times_quantity(client: AsyncClient) -> None:
     branch_id = await _create_branch()
     employee_id = await _create_employee(branch_id)
     variant_id = await _create_variant()
+    await price_variant_for_branch(variant_id, branch_id)
     ingredient_id = await _create_recipe_and_stock(variant_id, branch_id)
     order_id = await _open_order_with_item(
         client, headers, branch_id, employee_id, variant_id, quantity=3
@@ -267,6 +269,7 @@ async def test_insufficient_stock_goes_negative(client: AsyncClient) -> None:
     branch_id = await _create_branch()
     employee_id = await _create_employee(branch_id)
     variant_id = await _create_variant()
+    await price_variant_for_branch(variant_id, branch_id)
     ingredient_id = await _create_recipe_and_stock(
         variant_id, branch_id, recipe_qty="150", initial_stock="100"
     )
@@ -294,6 +297,7 @@ async def test_variant_without_recipe_cannot_be_ordered(client: AsyncClient) -> 
     branch_id = await _create_branch()
     employee_id = await _create_employee(branch_id)
     variant_id = await _create_variant()  # no recipe created
+    await price_variant_for_branch(variant_id, branch_id)
     await seed_open_cash_session(branch_id, employee_id)
     order_id = (
         await client.post(
@@ -326,6 +330,10 @@ async def test_cancelled_item_not_deducted(client: AsyncClient) -> None:
     branch_id = await _create_branch()
     employee_id = await _create_employee(branch_id)
     variant_id = await _create_variant()
+    # Precio 1 a propósito: esta prueba paga exactamente 1 para que la aritmética del stock se lea
+    # de un vistazo. Con el precio por defecto el pago no cubriría, la comanda no cerraría y el
+    # inventario no se descontaría — el fallo aparecería en el stock y la causa estaría en la caja.
+    await price_variant_for_branch(variant_id, branch_id, Decimal("1"))
     ingredient_id = await _create_recipe_and_stock(
         variant_id, branch_id, recipe_qty="100", initial_stock="1000"
     )
@@ -380,6 +388,7 @@ async def test_close_is_idempotent_for_deduction(client: AsyncClient) -> None:
     branch_id = await _create_branch()
     employee_id = await _create_employee(branch_id)
     variant_id = await _create_variant()
+    await price_variant_for_branch(variant_id, branch_id)
     ingredient_id = await _create_recipe_and_stock(variant_id, branch_id)
     order_id = await _open_order_with_item(
         client, headers, branch_id, employee_id, variant_id, quantity=2
@@ -417,6 +426,7 @@ async def test_close_updates_customer_stats(client: AsyncClient) -> None:
     branch_id = await _create_branch()
     employee_id = await _create_employee(branch_id)
     variant_id = await _create_variant()
+    await price_variant_for_branch(variant_id, branch_id)
     await _create_recipe_and_stock(variant_id, branch_id)
     customer_id = await _create_customer(client, headers)
     await seed_open_cash_session(branch_id, employee_id)
@@ -462,6 +472,7 @@ async def test_close_without_customer_leaves_stats_untouched(client: AsyncClient
     branch_id = await _create_branch()
     employee_id = await _create_employee(branch_id)
     variant_id = await _create_variant()
+    await price_variant_for_branch(variant_id, branch_id)
     await _create_recipe_and_stock(variant_id, branch_id)
     customer_id = await _create_customer(client, headers)
 

@@ -25,6 +25,8 @@ from restaurante.modules.menu.infrastructure.api.schemas import (
     CreateVariantGroupRequest,
     CreateVariantOptionRequest,
     MenuAppearanceConfigSchema,
+    OrderableProductResponse,
+    OrderableVariantResponse,
     ProductPriceResponse,
     ProductResponse,
     ProductVariantResponse,
@@ -106,6 +108,40 @@ async def create_product(
         tenant_id, payload.category_id, payload.name, payload.description, payload.image_url
     )
     return ProductResponse.model_validate(prod, from_attributes=True)
+
+
+@router.get(
+    "/orderable",
+    response_model=list[OrderableProductResponse],
+    dependencies=[_READ],
+)
+async def list_orderable(
+    branch_id: uuid.UUID,
+    service: MenuServiceDep,
+    tenant_id: TenantDep,
+) -> list[OrderableProductResponse]:
+    """Qué se puede pedir hoy en esa sede, con el precio de cada variante ya resuelto.
+
+    Existe para que la pantalla de comanda pinte sus mosaicos con UNA petición. Antes pedía los
+    productos, luego un endpoint de precios por producto y otro de variantes por producto: con 40
+    productos eran unas 81 peticiones antes de que el mesero pudiera tocar nada.
+
+    Va **antes** de `/products/{product_id}` en el fichero a propósito: si estuviera después,
+    FastAPI haría coincidir `orderable` con `{product_id}` e intentaría parsearlo como UUID.
+    """
+    products = await service.list_orderable(tenant_id, branch_id)
+    return [
+        OrderableProductResponse(
+            id=p.id,
+            category_id=p.category_id,
+            name=p.name,
+            variants=[
+                OrderableVariantResponse(id=v.id, name=v.name, price=v.price)
+                for v in p.variants
+            ],
+        )
+        for p in products
+    ]
 
 
 @router.get("/products", response_model=list[ProductResponse], dependencies=[_READ])

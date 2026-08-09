@@ -108,6 +108,16 @@ class OrderItem:
     notes: str | None = None
     # Derived read-only flag: the item has ≥1 kitchen ticket (routed / "en cocina").
     sent: bool = False
+    # Cómo se llama esto, resuelto al LEER. Es lo que permite pintar una línea sin haber leído el
+    # menú: antes el navegador se bajaba los 40 productos para traducir `product_variant_id` en
+    # "Bandeja paisa · Grande".
+    #
+    # Derivado, no almacenado, y la diferencia con `unit_price` es el corazón del change: el precio
+    # se ESTAMPA porque es dinero y no puede moverse; el nombre se resuelve porque renombrar un
+    # producto debe cambiar lo que dice una comanda viva. Guardarlo sería una segunda copia que se
+    # queda vieja.
+    product_name: str | None = None
+    variant_name: str | None = None
     id: uuid.UUID | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None

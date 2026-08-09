@@ -32,6 +32,7 @@ from restaurante.shared.database import SessionFactory
 from restaurante.shared.tenancy.models import BranchModel, TenantModel
 from tests.conftest import TEST_EMAIL, TEST_PASSWORD
 from tests.modules._cash import seed_open_cash_session
+from tests.modules._menu import price_variant_for_branch
 
 
 async def _demo_ids() -> tuple[uuid.UUID, uuid.UUID]:
@@ -411,6 +412,7 @@ async def test_item_add_does_not_route_until_send(client: AsyncClient) -> None:
     )
     employee_id = await _create_employee_only(branch_id)
     await seed_open_cash_session(branch_id, employee_id)
+    await price_variant_for_branch(variant_id, branch_id)
 
     order_id = (
         await client.post(
@@ -437,6 +439,7 @@ async def test_item_add_does_not_route_until_send(client: AsyncClient) -> None:
 
     # An UNMAPPED item adds fine too; still nothing on the board.
     _, variant2 = await _create_product_and_variant()
+    await price_variant_for_branch(variant2, branch_id)
     add2 = await client.post(
         f"/orders/{order_id}/items",
         headers=headers,
@@ -470,6 +473,7 @@ async def test_item_kitchen_note_reaches_the_board(client: AsyncClient) -> None:
     )
     employee_id = await _create_employee_only(branch_id)
     await seed_open_cash_session(branch_id, employee_id)
+    await price_variant_for_branch(variant_id, branch_id)
     order_id = (
         await client.post(
             "/orders",
@@ -509,6 +513,7 @@ async def test_item_add_without_kitchen_config_is_noop(client: AsyncClient) -> N
     _, variant_id = await _create_product_and_variant()
     employee_id = await _create_employee_only(branch_id)
     await seed_open_cash_session(branch_id, employee_id)
+    await price_variant_for_branch(variant_id, branch_id)
     order_id = (
         await client.post(
             "/orders",

@@ -97,3 +97,34 @@ class ProductVariantOption:
     product_variant_id: uuid.UUID
     variant_option_id: uuid.UUID
     id: uuid.UUID | None = None
+
+
+@dataclass(frozen=True)
+class OrderableVariant:
+    """Una variante que se puede pedir HOY en una sede, con su precio ya resuelto.
+
+    `price` es lo que se va a cobrar: precio del producto en esa sede **más** el recargo de las
+    opciones que la variante compone. Viene resuelto a propósito — si el cliente lo recompusiera
+    tendríamos dos fórmulas para el mismo número otra vez, que es el bug que
+    `server-prices-order-lines` vino a cerrar.
+    """
+
+    id: uuid.UUID
+    name: str | None
+    price: Decimal
+
+
+@dataclass(frozen=True)
+class OrderableProduct:
+    """Un producto vendible en una sede, con sus variantes pedibles.
+
+    "Vendible" es una afirmación fuerte y por eso este tipo existe aparte de `Product`: significa
+    activo, con precio en ESA sede y con al menos una variante activa. Un producto sin precio no se
+    puede pedir —`add_item` lo rechaza— así que enseñarlo como mosaico sería ofrecer algo que al
+    tocarlo da un error.
+    """
+
+    id: uuid.UUID
+    category_id: uuid.UUID
+    name: str
+    variants: list[OrderableVariant]

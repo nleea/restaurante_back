@@ -264,3 +264,31 @@ class MenuAppearanceConfigSchema(BaseModel):
     dishCard: DishCardSchema  # noqa: N815 — mirrors the frontend contract key
     dishDetail: DishDetailSchema  # noqa: N815 — mirrors the frontend contract key
     blockContent: BlockContentSchema  # noqa: N815 — mirrors the frontend contract key
+
+
+# --- Lo pedible en una sede ---------------------------------------------------
+class OrderableVariantResponse(BaseModel):
+    """Una variante pedible, con **el precio que se va a cobrar**.
+
+    Ya compuesto (precio de sede + recargo de las opciones). Que venga resuelto es deliberado: si el
+    cliente lo recompusiera habría dos fórmulas para el mismo número, que es el bug que este change
+    cerró. El mosaico enseña este número y `add_item` cobra este número.
+    """
+
+    id: uuid.UUID
+    name: str | None
+    price: Decimal
+
+
+class OrderableProductResponse(BaseModel):
+    """Un producto que se puede pedir hoy en esa sede, con sus variantes pedibles.
+
+    Sólo aparece lo vendible: activo, con precio en esa sede y con al menos una variante activa. Un
+    producto sin precio lo rechaza `add_item`, así que ofrecerlo como mosaico sería ofrecer algo que
+    al tocarlo da error.
+    """
+
+    id: uuid.UUID
+    category_id: uuid.UUID
+    name: str
+    variants: list[OrderableVariantResponse]

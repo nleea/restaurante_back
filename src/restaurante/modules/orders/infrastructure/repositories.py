@@ -40,7 +40,11 @@ from restaurante.modules.kitchen.infrastructure.models import (
 )
 from restaurante.modules.menu.infrastructure.models import (
     AddonModel,
+    ProductModel,
+    ProductPriceModel,
     ProductVariantModel,
+    ProductVariantOptionModel,
+    VariantOptionModel,
 )
 from restaurante.modules.orders.domain.entities import (
     CLAIM_PENDING,
@@ -135,7 +139,12 @@ def _order(m: OrderModel) -> Order:
     )
 
 
-def _item(m: OrderItemModel, *, sent: bool = False) -> OrderItem:
+def _item(
+    m: OrderItemModel,
+    *,
+    sent: bool = False,
+    labels: tuple[str, str | None] | None = None,
+) -> OrderItem:
     return OrderItem(
         id=m.id,
         tenant_id=m.tenant_id,
@@ -148,6 +157,8 @@ def _item(m: OrderItemModel, *, sent: bool = False) -> OrderItem:
         status=m.status,
         notes=m.notes,
         sent=sent,
+        product_name=labels[0] if labels else None,
+        variant_name=labels[1] if labels else None,
         created_at=m.created_at,
         updated_at=m.updated_at,
     )
@@ -354,6 +365,71 @@ class SqlAlchemyOrdersRepository:
             )
         )
         return bool((await self._session.execute(stmt)).scalar())
+
+    async def resolve_line_price(
+        self,
+        tenant_id: uuid.UUID,
+        product_variant_id: uuid.UUID,
+        branch_id: uuid.UUID,
+    ) -> Decimal | None:
+        """Precio del producto en esa sede + recargo de la variante. `None` si no hay precio.
+
+        Dos consultas y no una, a propósito: el precio es una lectura de fila y el recargo es una
+        AGREGACIÓN sobre las opciones que la variante compone. Meterlas en un solo `select` con un
+        `LEFT JOIN` a la agregación es posible y hace que un fallo en la mitad de arriba (no hay
+        precio) se confunda con un cero de la mitad de abajo (no hay recargo) — que es exactamente
+        la distinción de la que depende el rechazo. Dos consultas legibles ganan a una lista.
+
+        **`extra_price` no es una columna de `product_variants`.** Sus columnas son
+        `id, product_id, name, is_active, tenant_id`. El recargo es la suma de
+        `variant_options.extra_price` de las opciones que la variante compone vía
+        `product_variant_options`; el API lo expone como campo derivado, y `menu` ya tiene esta
+        misma consulta en `extra_price_of`. Se copia en vez de llamarse al otro módulo por la misma
+        razón que `variant_has_recipe` lee `recipe_items` directamente: el límite de la venta es
+        quien necesita el dato, y una llamada entre servicios aquí sería un acoplamiento por
+        comodidad.
+
+        El precio se busca por la sede que se le pasa, que es la del PEDIDO. Buscarlo por la sede
+        "activa" de quien pide sería el bug obvio: un cajero mirando otra sucursal cobraría con los
+        precios de la suya.
+        """
+        base = (
+            await self._session.execute(
+                select(ProductPriceModel.price)
+                .join(
+                    ProductVariantModel,
+                    ProductVariantModel.product_id == ProductPriceModel.product_id,
+                )
+                .where(
+                    ProductVariantModel.id == product_variant_id,
+                    ProductVariantModel.tenant_id == tenant_id,
+                    ProductPriceModel.tenant_id == tenant_id,
+                    ProductPriceModel.branch_id == branch_id,
+                    ProductPriceModel.is_active.is_(True),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if base is None:
+            # Ni cero ni excepción: `None` es "no tiene precio aquí", y quien llama decide.
+            return None
+
+        surcharge = (
+            await self._session.execute(
+                select(func.coalesce(func.sum(VariantOptionModel.extra_price), 0))
+                .select_from(ProductVariantOptionModel)
+                .join(
+                    VariantOptionModel,
+                    VariantOptionModel.id
+                    == ProductVariantOptionModel.variant_option_id,
+                )
+                .where(
+                    ProductVariantOptionModel.product_variant_id == product_variant_id,
+                    ProductVariantOptionModel.tenant_id == tenant_id,
+                )
+            )
+        ).scalar_one()
+        return Decimal(base) + Decimal(surcharge)
 
     async def addon_exists(self, tenant_id: uuid.UUID, addon_id: uuid.UUID) -> bool:
         stmt = select(AddonModel.id).where(
@@ -859,7 +935,8 @@ class SqlAlchemyOrdersRepository:
         self._session.add(model)
         await self._session.commit()
         await self._session.refresh(model)
-        return _item(model)
+        labels = await self._labels_of(model.tenant_id, [model.product_variant_id])
+        return _item(model, labels=labels.get(model.product_variant_id))
 
     async def _get_item_model(
         self, tenant_id: uuid.UUID, item_id: uuid.UUID
@@ -869,11 +946,44 @@ class SqlAlchemyOrdersRepository:
         )
         return (await self._session.execute(stmt)).scalar_one_or_none()
 
+    async def _labels_of(
+        self, tenant_id: uuid.UUID, variant_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, tuple[str, str | None]]:
+        """`{variante: (producto, variante)}` para TODAS las variantes de una vez.
+
+        Una consulta para la lista entera, no una por línea. Si esto acabara siendo N+1, el change
+        se habría convertido en su propio problema: nació para matar un fan-out de 52 peticiones.
+
+        Es el mismo join que `messaging.order_lines` ya hacía para contarle a un cliente por
+        WhatsApp qué había pedido. El Salón era el único consumidor que lo resolvía en el navegador,
+        bajándose el menú completo para traducir un id en un nombre.
+        """
+        if not variant_ids:
+            return {}
+        rows = (
+            await self._session.execute(
+                select(
+                    ProductVariantModel.id,
+                    ProductModel.name,
+                    ProductVariantModel.name,
+                )
+                .join(ProductModel, ProductModel.id == ProductVariantModel.product_id)
+                .where(
+                    ProductVariantModel.id.in_(variant_ids),
+                    ProductVariantModel.tenant_id == tenant_id,
+                )
+            )
+        ).all()
+        return {r[0]: (r[1], r[2]) for r in rows}
+
     async def get_item(
         self, tenant_id: uuid.UUID, item_id: uuid.UUID
     ) -> OrderItem | None:
         model = await self._get_item_model(tenant_id, item_id)
-        return _item(model) if model else None
+        if model is None:
+            return None
+        labels = await self._labels_of(tenant_id, [model.product_variant_id])
+        return _item(model, labels=labels.get(model.product_variant_id))
 
     async def list_items(
         self, tenant_id: uuid.UUID, order_id: uuid.UUID
@@ -899,7 +1009,71 @@ class SqlAlchemyOrdersRepository:
             sent_ids = {
                 row for row in (await self._session.execute(sent_stmt)).scalars()
             }
-        return [_item(m, sent=m.id in sent_ids) for m in models]
+        labels = await self._labels_of(
+            tenant_id, [m.product_variant_id for m in models]
+        )
+        return [
+            _item(
+                m,
+                sent=m.id in sent_ids,
+                labels=labels.get(m.product_variant_id),
+            )
+            for m in models
+        ]
+
+    async def list_items_for_orders(
+        self, tenant_id: uuid.UUID, order_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, list[OrderItem]]:
+        """Los ítems de VARIAS comandas, agrupados. Tres consultas en total, no tres por comanda.
+
+        Existe para que pintar un salón sea una petición y no una por mesa. Y por eso está escrito
+        con `IN (...)` y no con un bucle sobre `list_items`: un bucle habría movido el fan-out de la
+        red a la base de datos, que es cambiar de sitio el problema en vez de quitarlo.
+        """
+        if not order_ids:
+            return {}
+        models = list(
+            (
+                await self._session.execute(
+                    select(OrderItemModel)
+                    .where(
+                        OrderItemModel.tenant_id == tenant_id,
+                        OrderItemModel.order_id.in_(order_ids),
+                    )
+                    .order_by(OrderItemModel.created_at)
+                )
+            ).scalars()
+        )
+        if not models:
+            return {}
+
+        sent_ids = {
+            row
+            for row in (
+                await self._session.execute(
+                    select(OrderItemStationModel.order_item_id).where(
+                        OrderItemStationModel.tenant_id == tenant_id,
+                        OrderItemStationModel.order_item_id.in_(
+                            [m.id for m in models]
+                        ),
+                    )
+                )
+            ).scalars()
+        }
+        labels = await self._labels_of(
+            tenant_id, [m.product_variant_id for m in models]
+        )
+
+        grouped: dict[uuid.UUID, list[OrderItem]] = {}
+        for m in models:
+            grouped.setdefault(m.order_id, []).append(
+                _item(
+                    m,
+                    sent=m.id in sent_ids,
+                    labels=labels.get(m.product_variant_id),
+                )
+            )
+        return grouped
 
     async def update_item(
         self, tenant_id: uuid.UUID, item_id: uuid.UUID, fields: dict[str, Any]
@@ -911,7 +1085,8 @@ class SqlAlchemyOrdersRepository:
             setattr(model, key, value)
         await self._session.commit()
         await self._session.refresh(model)
-        return _item(model)
+        labels = await self._labels_of(model.tenant_id, [model.product_variant_id])
+        return _item(model, labels=labels.get(model.product_variant_id))
 
     async def _addons_sum(self, tenant_id: uuid.UUID, item_id: uuid.UUID) -> Decimal:
         stmt = select(
@@ -932,7 +1107,8 @@ class SqlAlchemyOrdersRepository:
         model.line_subtotal = model.unit_price * model.quantity + addons
         await self._session.commit()
         await self._session.refresh(model)
-        return _item(model)
+        labels = await self._labels_of(model.tenant_id, [model.product_variant_id])
+        return _item(model, labels=labels.get(model.product_variant_id))
 
     async def delete_item(self, tenant_id: uuid.UUID, item_id: uuid.UUID) -> None:
         await self._session.execute(

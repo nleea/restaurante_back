@@ -598,6 +598,17 @@ class OrderService:
         await self._require_item(tenant_id, item_id)
         return await self._repo.list_item_addons(tenant_id, item_id)
 
+    async def items_by_order(
+        self, tenant_id: uuid.UUID, order_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, list[OrderItem]]:
+        """Los ítems de varias comandas, para servir `?include=items` en una consulta.
+
+        No se llama desde `list_orders` sino desde el router, y a propósito: quien decide si los
+        ítems hacen falta es quien atiende la petición. Meterlo dentro de `list_orders` obligaría a
+        pasarle una bandera de presentación a un caso de uso que sólo sabe de pedidos.
+        """
+        return await self._repo.list_items_for_orders(tenant_id, order_ids)
+
     async def list_orders(
         self,
         tenant_id: uuid.UUID,
@@ -655,15 +666,43 @@ class OrderService:
         return updated
 
     # --- Items -------------------------------------------------------------
+    async def line_price(
+        self,
+        tenant_id: uuid.UUID,
+        product_variant_id: uuid.UUID,
+        branch_id: uuid.UUID,
+    ) -> Decimal | None:
+        """Lo que costaría esa variante en esa sede. `None` si no tiene precio ahí.
+
+        Lectura pura, y existe por una razón concreta: la carta pública tiene que **decirle al
+        cliente cuánto va a deber ANTES de escribir nada**, así que necesita el número antes de
+        llamar a `add_item`. Si lo calculara por su cuenta habría otra vez dos fórmulas, y la que
+        divergiría sería la que el cliente ve — la peor de las dos.
+
+        No es una puerta para volver a pasar el precio: `add_item` lo resuelve igual cuando escribe.
+        Esto sólo permite anunciarlo, y anunciar el mismo número que se va a cobrar es el objetivo.
+        """
+        return await self._repo.resolve_line_price(
+            tenant_id, product_variant_id, branch_id
+        )
+
     async def add_item(
         self,
         tenant_id: uuid.UUID,
         order_id: uuid.UUID,
         product_variant_id: uuid.UUID,
         quantity: int,
-        unit_price: Decimal,
         notes: str | None = None,
     ) -> OrderItem:
+        """Añade una línea. **El precio no viaja: lo resuelve esta función.**
+
+        No recibirlo es la mitad del diseño. Cuando el precio era un parámetro, tres caminos lo
+        calculaban de tres formas —el salón sumaba el recargo de la variante, la carta pública no,
+        y esta función se creía lo que le llegara— y el navegador tenía que bajarse el menú entero
+        para poder decir un número. Que el parámetro **no exista** es lo que hace que el cuarto
+        camino que aparezca no pueda volver a divergir; una convención sobre "quién lo busca"
+        depende de que alguien la recuerde.
+        """
         order = await self._require_open_order(tenant_id, order_id)
         if not await self._repo.variant_exists(tenant_id, product_variant_id):
             raise NotFoundError(
@@ -677,6 +716,18 @@ class OrderService:
             )
         if quantity <= 0:
             raise ValidationError("La cantidad debe ser positiva.")
+        # La segunda red del mismo límite, y hermana de la de arriba: una variante sin receta no se
+        # vende porque no descontaría inventario, y un producto sin precio en esta sede no se vende
+        # porque se regalaría. Antes de esto los tres caminos lo convertían en cero —`?? 0` en el
+        # salón, `else Decimal(0)` dos veces en el storefront—, y un cero en el camino del dinero no
+        # se ve hasta que se cuenta el turno.
+        unit_price = await self._repo.resolve_line_price(
+            tenant_id, product_variant_id, order.branch_id
+        )
+        if unit_price is None:
+            raise ValidationError(
+                "El producto no tiene precio en esta sede; no se puede vender."
+            )
         item = await self._repo.create_item(
             OrderItem(
                 tenant_id=tenant_id,
@@ -715,7 +766,6 @@ class OrderService:
         tenant_id: uuid.UUID,
         item_id: uuid.UUID,
         product_variant_id: uuid.UUID,
-        unit_price: Decimal,
     ) -> OrderItem:
         """Cambia el producto de una línea, conservando su cantidad y sus adiciones.
 
@@ -723,9 +773,13 @@ class OrderService:
         equivalente. Por la vía pública no lo es — quitar es justo lo que no se le deja hacer
         al cliente—, así que cambiar tiene que ser una sola operación.
 
-        Se repiten aquí las dos redes de seguridad de `add_item` porque una línea que cambia de
-        producto es una venta nueva: la variante tiene que existir y tener receta, o estaríamos
-        vendiendo algo que no descontaría inventario.
+        Se repiten aquí las **tres** redes de seguridad de `add_item` porque una línea que cambia de
+        producto es una venta nueva: la variante tiene que existir, tener receta —o estaríamos
+        vendiendo algo que no descontaría inventario— y tener precio en esta sede.
+
+        Y por eso el precio tampoco viaja aquí: se re-cotiza por el mismo sitio. Dejarlo como
+        parámetro habría sido la puerta de atrás del change — cambiar el producto de una línea es
+        exactamente donde un precio viejo se quedaría pegado a un producto nuevo.
         """
         item = await self._require_item(tenant_id, item_id)
         order = await self._require_open_order(tenant_id, item.order_id)
@@ -736,6 +790,13 @@ class OrderService:
         if not await self._repo.variant_has_recipe(tenant_id, product_variant_id):
             raise ValidationError(
                 "El producto no tiene receta; no descontaría inventario."
+            )
+        unit_price = await self._repo.resolve_line_price(
+            tenant_id, product_variant_id, order.branch_id
+        )
+        if unit_price is None:
+            raise ValidationError(
+                "El producto no tiene precio en esta sede; no se puede vender."
             )
         await self._repo.update_item(
             tenant_id,
