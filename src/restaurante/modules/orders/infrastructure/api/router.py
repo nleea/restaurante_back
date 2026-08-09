@@ -10,7 +10,7 @@ from __future__ import annotations
 import uuid
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, Response, status
+from fastapi import APIRouter, Depends, Query, Response, status
 from fastapi.responses import StreamingResponse
 
 from restaurante.modules.identity.infrastructure.api.deps import require_permission
@@ -317,7 +317,21 @@ async def list_orders(
     status_filter: str | None = None,
     dining_table_id: uuid.UUID | None = None,
     open_session_only: bool = False,
+    include: str | None = Query(
+        default=None,
+        description="`items` para traer las líneas de cada comanda. Es la única clave admitida.",
+    ),
 ) -> list[OrderResponse]:
+    """Las comandas, y opcionalmente sus líneas.
+
+    `?include=items` existe para que pintar un salón de doce mesas sea UNA petición en vez de trece.
+    No pedirlo no cuesta nada: no se lee ni un ítem, así que quien sólo quiere comandas paga
+    exactamente lo que pagaba.
+
+    Se admite **una** clave y no una lista a propósito. Un `include` que crece acaba dando una forma
+    distinta de pedido por pantalla, que es lo que un recurso único debería evitar; el día que
+    alguien quiera `include=payments,delivery` es el día de discutirlo, no hoy.
+    """
     # `open_session_only=true` is the live salón scope: only the branch's open cash session.
     orders = await service.list_orders(
         tenant_id,
@@ -326,7 +340,20 @@ async def list_orders(
         dining_table_id=dining_table_id,
         open_session_only=open_session_only,
     )
-    return [OrderResponse.model_validate(o, from_attributes=True) for o in orders]
+    responses = [OrderResponse.model_validate(o, from_attributes=True) for o in orders]
+    if include != "items":
+        return responses
+    # Una consulta agrupada para TODAS las comandas. Un bucle aquí movería el fan-out de la red a
+    # la base de datos, que es cambiar el problema de sitio en vez de quitarlo.
+    grouped = await service.items_by_order(
+        tenant_id, [o.id for o in orders if o.id is not None]
+    )
+    for response in responses:
+        response.items = [
+            OrderItemResponse.model_validate(i, from_attributes=True)
+            for i in grouped.get(response.id, [])
+        ]
+    return responses
 
 
 @router.get("/{order_id}", response_model=OrderResponse, dependencies=[_READ])
@@ -580,12 +607,12 @@ async def add_item(
     service: OrderServiceDep,
     tenant_id: TenantDep,
 ) -> OrderItemResponse:
+    # `payload.unit_price` existe, se acepta y NO se pasa: el precio lo resuelve el servicio.
     item = await service.add_item(
         tenant_id,
         order_id,
         payload.product_variant_id,
         payload.quantity,
-        payload.unit_price,
         payload.notes,
     )
     return OrderItemResponse.model_validate(item, from_attributes=True)

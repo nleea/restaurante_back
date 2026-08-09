@@ -33,6 +33,7 @@ from restaurante.shared.database import SessionFactory
 from restaurante.shared.tenancy.models import BranchModel, TenantModel
 from tests.conftest import TEST_EMAIL, TEST_PASSWORD
 from tests.modules._cash import seed_open_cash_session
+from tests.modules._menu import price_variant_for_branch
 
 
 async def _demo_ids() -> tuple[uuid.UUID, uuid.UUID]:
@@ -200,6 +201,7 @@ async def test_assign_customer_then_close_on_credit(client: AsyncClient) -> None
     branch_id = await _create_branch()
     employee_id = await _create_employee(branch_id)
     variant_id = await _create_variant()
+    await price_variant_for_branch(variant_id, branch_id)
     customer_id = await _create_customer(client, headers)
     order_id = await _open_order(client, headers, branch_id, employee_id, variant_id)
 
@@ -230,6 +232,7 @@ async def test_assign_customer_to_closed_order_rejected(client: AsyncClient) -> 
     branch_id = await _create_branch()
     employee_id = await _create_employee(branch_id)
     variant_id = await _create_variant()
+    await price_variant_for_branch(variant_id, branch_id)
     customer_id = await _create_customer(client, headers)
     await seed_open_cash_session(branch_id, employee_id)
     # Open with a customer so it can close fully on credit, then it's closed.
@@ -264,6 +267,7 @@ async def test_assign_unknown_customer_404(client: AsyncClient) -> None:
     branch_id = await _create_branch()
     employee_id = await _create_employee(branch_id)
     variant_id = await _create_variant()
+    await price_variant_for_branch(variant_id, branch_id)
     order_id = await _open_order(client, headers, branch_id, employee_id, variant_id)
 
     assign = await client.post(

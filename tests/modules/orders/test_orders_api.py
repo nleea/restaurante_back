@@ -32,6 +32,7 @@ from restaurante.shared.database import SessionFactory
 from restaurante.shared.tenancy.models import BranchModel, TenantModel
 from tests.conftest import TEST_EMAIL, TEST_PASSWORD
 from tests.modules._cash import seed_open_cash_session
+from tests.modules._menu import price_variant_for_branch
 
 
 async def _demo_ids() -> tuple[uuid.UUID, uuid.UUID]:
@@ -161,6 +162,9 @@ async def _setup_order(client: AsyncClient, headers: dict[str, str]) -> dict[str
     employee_id = await _create_employee(branch_id)
     await seed_open_cash_session(branch_id, employee_id)
     variant_id = await _create_variant()
+    # Tercera red del límite de la venta, junto a la receta y la caja abierta: sin precio en esta
+    # sede `add_item` rechaza en vez de vender a cero.
+    await price_variant_for_branch(variant_id, branch_id)
     table_resp = await client.post(
         "/orders/tables",
         headers=headers,

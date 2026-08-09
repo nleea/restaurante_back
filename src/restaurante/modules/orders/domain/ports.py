@@ -123,6 +123,26 @@ class OrdersRepository(Protocol):
         self, tenant_id: uuid.UUID, product_variant_id: uuid.UUID
     ) -> bool: ...
 
+    async def resolve_line_price(
+        self,
+        tenant_id: uuid.UUID,
+        product_variant_id: uuid.UUID,
+        branch_id: uuid.UUID,
+    ) -> Decimal | None:
+        """El precio de una línea: precio del producto en ESA sede + recargo de la variante.
+
+        `None` cuando el producto no tiene precio activo en esa sede — y `None` es un valor
+        distinto de cero a propósito. Quien llama tiene que rechazar la venta, no venderla
+        gratis: un `?? 0` en el camino del dinero es un regalo que nadie autorizó y que no se ve
+        hasta que se cuenta el turno.
+
+        Está en el puerto —y no en tres sitios que lo calculen por su cuenta— porque el precio
+        de una línea se calculaba en el navegador del salón (`base + extra`), en el storefront
+        (sólo `base`) y no se calculaba en `add_item`, que se creía lo que le mandaran. Tres
+        fórmulas para el mismo número.
+        """
+        ...
+
     async def addon_exists(
         self, tenant_id: uuid.UUID, addon_id: uuid.UUID
     ) -> bool: ...
@@ -283,6 +303,17 @@ class OrdersRepository(Protocol):
     async def get_item(
         self, tenant_id: uuid.UUID, item_id: uuid.UUID
     ) -> OrderItem | None: ...
+
+    async def list_items_for_orders(
+        self, tenant_id: uuid.UUID, order_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, list[OrderItem]]:
+        """Los ítems de varias comandas, agrupados por comanda. En consultas AGRUPADAS.
+
+        Está en el puerto —y no como un bucle en el servicio— porque "agrupado" es la propiedad
+        que importa: un bucle sobre `list_items` daría el mismo resultado moviendo el fan-out de la
+        red a la base de datos.
+        """
+        ...
 
     async def list_items(
         self, tenant_id: uuid.UUID, order_id: uuid.UUID

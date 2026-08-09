@@ -116,6 +116,21 @@ class Settings(BaseSettings):
     # Silence after which a new inbound message opens a fresh conversation instead of
     # joining the old one. 24h matches how people think about a WhatsApp chat.
     whatsapp_conversation_idle_hours: int = 24
+    # --- Estados de WhatsApp (publicación programada) -------------------------
+    # Los tres ajustes que acotan el riesgo de que publicar estados tumbe el número del negocio.
+    # Son ajustes y no constantes porque el valor correcto sólo se sabe viendo si el número aguanta,
+    # y una constante obligaría a un despliegue para averiguarlo. Arrancar BAJO y subir mirando.
+    #
+    # El tope está acotado por `ABSOLUTE_RECIPIENT_CEILING` del dominio, que este ajuste NO puede
+    # superar: un techo configurable no es un techo.
+    whatsapp_status_recipient_cap: int = 200
+    # Quien no escribe desde hace tanto casi seguro borró el chat y ya no nos tiene guardados: es
+    # volumen de salida sin audiencia posible. Recorta riesgo sin perder espectadores, y por eso
+    # vale más que el tope.
+    whatsapp_status_inactivity_days: int = 90
+    # Cuánto tarde puede llegar una franja y aún publicarse. Un estado caduca a las 24h, así que
+    # sacar el menú del día por la tarde porque el worker estuvo caído es peor que no sacarlo.
+    whatsapp_status_grace_minutes: int = 30
     # Cómo nos ve el puente DESDE FUERA. Evolution corre en otra máquina, así que un
     # `localhost` aquí significa que sus webhooks se los manda a sí mismo y ningún mensaje
     # entra nunca — sin error visible en ningún lado.

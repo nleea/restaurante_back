@@ -45,6 +45,7 @@ from restaurante.modules.messaging.application.use_cases.manage_messaging import
 )
 from restaurante.modules.messaging.domain.errors import SessionNotFoundError
 from restaurante.modules.messaging.domain.quick_reply import SUGGESTED_QUICK_REPLIES
+from restaurante.modules.messaging.domain.status_schedule import StatusSlot
 from restaurante.modules.messaging.domain.templates import (
     AWAITING_PAYMENT_PLACEHOLDERS,
     FAQ_PLACEHOLDERS,
@@ -53,9 +54,11 @@ from restaurante.modules.messaging.domain.templates import (
 )
 from restaurante.modules.messaging.infrastructure.api.deps import (
     MessagingServiceDep,
+    StatusServiceDep,
     TenantDep,
 )
 from restaurante.modules.messaging.infrastructure.api.schemas import (
+    AudiencePreviewResponse,
     AutoreplyDefaultsResponse,
     AutoreplySettingsSchema,
     ConversationResponse,
@@ -64,12 +67,18 @@ from restaurante.modules.messaging.infrastructure.api.schemas import (
     FaqSchema,
     MenuLinkResponse,
     PairingResponse,
+    PublicationResponse,
     QuickRepliesResponse,
     QuickReplySchema,
     ReplyRequest,
     SessionResponse,
     SessionStatusRequest,
+    StatusImageResponse,
     StatusMessageSchema,
+    StatusOptOutRequest,
+    StatusRequest,
+    StatusResponse,
+    StatusSlotSchema,
     ThreadResponse,
     UseAsProofRequest,
     WebhookAck,
@@ -78,8 +87,11 @@ from restaurante.modules.messaging.infrastructure.api.schemas import (
     delivery_update,
     session_response,
 )
+from restaurante.modules.messaging.infrastructure.media_store import store_status_media
 from restaurante.shared.config import get_settings
+from restaurante.shared.domain.errors import ValidationError
 from restaurante.shared.realtime.deps import EventStreamDep, event_stream_response
+from restaurante.shared.storage.deps import build_object_storage
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +156,31 @@ async def claim_conversation(
         tenant_id, current_user.id, branch_id
     )
     await service.claim(tenant_id, branch_id, conversation_id, employee_id)
+    thread = await service.get_thread(tenant_id, branch_id, conversation_id)
+    return ThreadResponse.from_thread(thread)
+
+
+@router.put(
+    "/conversations/{conversation_id}/status-opt-out",
+    response_model=ThreadResponse,
+    dependencies=[_ATTEND],
+)
+async def set_status_opt_out(
+    conversation_id: uuid.UUID,
+    branch_id: BranchQuery,
+    payload: StatusOptOutRequest,
+    service: MessagingServiceDep,
+    tenant_id: TenantDep,
+) -> ThreadResponse:
+    """"Este contacto no quiere estados", desde el hilo donde lo pidió.
+
+    Gateado con `messaging.attend` y no con `manage`: lo usa quien lee los chats, no quien configura
+    las publicaciones. La petición llega en el chat y quien la lee es quien atiende — pedirle un
+    permiso de administración para cumplirla es cómo se consigue que no se cumpla.
+    """
+    await service.set_status_opt_out(
+        tenant_id, branch_id, conversation_id, payload.opted_out
+    )
     thread = await service.get_thread(tenant_id, branch_id, conversation_id)
     return ThreadResponse.from_thread(thread)
 
@@ -382,6 +419,175 @@ async def close_conversation(
     await service.close(tenant_id, branch_id, conversation_id)
     thread = await service.get_thread(tenant_id, branch_id, conversation_id)
     return ThreadResponse.from_thread(thread)
+
+
+# --- Estados programados ----------------------------------------------------
+# Todo con `messaging.manage`, que YA existe en el catálogo (gatea el editor de autorespuestas).
+# Un permiso nuevo habría exigido volver a sembrar el catálogo, y sin `scripts.seed` la pantalla
+# daría 403 para todos — que es un fallo que este repo ya cometió una vez.
+@router.get(
+    "/statuses", response_model=list[StatusResponse], dependencies=[_MANAGE]
+)
+async def list_statuses(
+    branch_id: BranchQuery,
+    service: StatusServiceDep,
+    tenant_id: TenantDep,
+) -> list[StatusResponse]:
+    statuses = await service.list_statuses(tenant_id, branch_id)
+    return [StatusResponse.from_status(s) for s in statuses]
+
+
+@router.get(
+    "/statuses/audience",
+    response_model=AudiencePreviewResponse,
+    dependencies=[_MANAGE],
+)
+async def preview_status_audience(
+    branch_id: BranchQuery,
+    service: StatusServiceDep,
+    tenant_id: TenantDep,
+) -> AudiencePreviewResponse:
+    """La audiencia y sus cuatro bajas, ANTES de programar nada.
+
+    Va antes que `/statuses/{status_id}` en el fichero a propósito: si estuviera después, FastAPI
+    haría coincidir `audience` con `{status_id}` e intentaría parsearlo como UUID.
+    """
+    return AudiencePreviewResponse.from_audience(
+        await service.preview_audience(tenant_id, branch_id)
+    )
+
+
+@router.post(
+    "/statuses/image", response_model=StatusImageResponse, dependencies=[_MANAGE]
+)
+async def upload_status_image(
+    service: StatusServiceDep,
+    tenant_id: TenantDep,
+    file: Annotated[UploadFile, File()],
+) -> StatusImageResponse:
+    """Sube la imagen y devuelve su URL, para guardarla luego en el estado.
+
+    Dos pasos y no uno porque al proveedor le va una URL, no bytes: el archivo tiene que existir en
+    R2 antes de que el estado se pueda publicar. Y se sube antes de crear el estado porque el dueño
+    elige la foto mientras compone, no al final.
+    """
+    url = await store_status_media(
+        tenant_id,
+        file.content_type or "",
+        await file.read(),
+        storage=build_object_storage(),
+    )
+    if url is None:
+        raise ValidationError(
+            "No se pudo guardar la imagen. Revisa el tipo y el tamaño del archivo."
+        )
+    return StatusImageResponse(url=url)
+
+
+@router.get(
+    "/statuses/{status_id}", response_model=StatusResponse, dependencies=[_MANAGE]
+)
+async def get_status(
+    status_id: uuid.UUID,
+    branch_id: BranchQuery,
+    service: StatusServiceDep,
+    tenant_id: TenantDep,
+) -> StatusResponse:
+    return StatusResponse.from_status(
+        await service.get_status(tenant_id, branch_id, status_id)
+    )
+
+
+@router.post(
+    "/statuses",
+    response_model=StatusResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[_MANAGE],
+)
+async def create_status(
+    branch_id: BranchQuery,
+    payload: StatusRequest,
+    service: StatusServiceDep,
+    tenant_id: TenantDep,
+    current_user: CurrentUserDep,
+) -> StatusResponse:
+    created = await service.create_status(
+        tenant_id,
+        branch_id,
+        status_type=payload.type,
+        content=payload.content,
+        slots=_slots(payload.slots),
+        bg_color=payload.bg_color,
+        font=payload.font,
+        caption=payload.caption,
+        media_url=payload.media_url,
+        created_by=None,
+    )
+    return StatusResponse.from_status(created)
+
+
+@router.put(
+    "/statuses/{status_id}", response_model=StatusResponse, dependencies=[_MANAGE]
+)
+async def update_status(
+    status_id: uuid.UUID,
+    branch_id: BranchQuery,
+    payload: StatusRequest,
+    service: StatusServiceDep,
+    tenant_id: TenantDep,
+) -> StatusResponse:
+    updated = await service.update_status(
+        tenant_id,
+        branch_id,
+        status_id,
+        status_type=payload.type,
+        content=payload.content,
+        slots=_slots(payload.slots),
+        bg_color=payload.bg_color,
+        font=payload.font,
+        caption=payload.caption,
+        media_url=payload.media_url,
+        active=payload.active,
+    )
+    return StatusResponse.from_status(updated)
+
+
+@router.delete(
+    "/statuses/{status_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[_MANAGE],
+)
+async def delete_status(
+    status_id: uuid.UUID,
+    branch_id: BranchQuery,
+    service: StatusServiceDep,
+    tenant_id: TenantDep,
+) -> Response:
+    await service.delete_status(tenant_id, branch_id, status_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
+    "/statuses/{status_id}/publications",
+    response_model=list[PublicationResponse],
+    dependencies=[_MANAGE],
+)
+async def list_status_publications(
+    status_id: uuid.UUID,
+    branch_id: BranchQuery,
+    service: StatusServiceDep,
+    tenant_id: TenantDep,
+) -> list[PublicationResponse]:
+    """Qué pasó cada vez que venció una franja. Publicado / falló / omitido, nunca "visto por"."""
+    publications = await service.list_publications(tenant_id, branch_id, status_id)
+    return [PublicationResponse.from_publication(p) for p in publications]
+
+
+def _slots(raw: list[StatusSlotSchema]) -> list[StatusSlot]:
+    """Del contrato al dominio. La validación la hace `validate_slots`, no esto."""
+    return [
+        StatusSlot(minute=s.minute, weekday=s.weekday, on_date=s.on_date) for s in raw
+    ]
 
 
 @router.get("/events", dependencies=[_READ])

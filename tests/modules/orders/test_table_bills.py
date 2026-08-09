@@ -29,6 +29,7 @@ from restaurante.modules.orders.infrastructure.repositories import (
 from restaurante.shared.database import SessionFactory
 from restaurante.shared.domain.errors import ConflictError, ValidationError
 from tests.modules._cash import seed_open_cash_session
+from tests.modules._menu import price_variant_for_branch
 from tests.modules.orders.test_orders_api import (
     _assign_role,
     _create_branch,
@@ -51,7 +52,13 @@ class Scenario:
 
 
 async def _seed(client: AsyncClient, amounts: list[str]) -> Scenario:
-    """Crea una mesa con una comanda por importe, cada una con un ítem de ese precio."""
+    """Crea una mesa con una comanda por importe, cada una con un ítem de ese precio.
+
+    **Un producto distinto por importe**, y no el mismo con tres precios. Antes se conseguía
+    mandando `unit_price` en cada línea; ahora el precio lo pone el catálogo, así que tres importes
+    son tres productos. Y de paso el escenario se parece más a la mesa que representa: tres
+    comensales que pidieron platos distintos, no tres precios para el mismo plato.
+    """
     await _assign_role("admin")
     headers = await _login(client)
     tenant_id, _ = await _demo_ids()
@@ -59,7 +66,6 @@ async def _seed(client: AsyncClient, amounts: list[str]) -> Scenario:
     branch_id = await _create_branch(code=f"B{uuid.uuid4().hex[:6]}")
     employee_id = await _create_employee(branch_id, email=f'w{uuid.uuid4().hex[:8]}@demo.com')
     await seed_open_cash_session(branch_id, employee_id)
-    variant_id = await _create_variant()
 
     table = await client.post(
         "/orders/tables",
@@ -69,7 +75,9 @@ async def _seed(client: AsyncClient, amounts: list[str]) -> Scenario:
     table_id = uuid.UUID(table.json()["id"])
 
     order_ids = []
-    for amount in amounts:
+    for index, amount in enumerate(amounts):
+        variant_id = await _create_variant(name=f"Plato {index}")
+        await price_variant_for_branch(variant_id, branch_id, Decimal(amount))
         resp = await client.post(
             "/orders",
             headers=headers,
@@ -84,11 +92,7 @@ async def _seed(client: AsyncClient, amounts: list[str]) -> Scenario:
         await client.post(
             f"/orders/{order_id}/items",
             headers=headers,
-            json={
-                "product_variant_id": str(variant_id),
-                "quantity": 1,
-                "unit_price": amount,
-            },
+            json={"product_variant_id": str(variant_id), "quantity": 1},
         )
         order_ids.append(uuid.UUID(order_id))
     return Scenario(tenant_id, branch_id, employee_id, table_id, order_ids)

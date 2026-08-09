@@ -43,6 +43,7 @@ from restaurante.shared.database import SessionFactory
 from restaurante.shared.tenancy.models import BranchModel, TenantModel
 from tests.conftest import TEST_EMAIL, TEST_PASSWORD
 from tests.modules._cash import seed_open_cash_session
+from tests.modules._menu import price_variant_for_branch
 
 
 # --- shared helpers ---------------------------------------------------------
@@ -363,6 +364,7 @@ async def test_add_item_after_ready_returns_to_in_kitchen(
     await _attach(client, headers, product_id, station)
     employee_id = await _create_employee(branch_id)
     await seed_open_cash_session(branch_id, employee_id)
+    await price_variant_for_branch(variant_id, branch_id)
     order_id = (
         await client.post(
             "/orders",

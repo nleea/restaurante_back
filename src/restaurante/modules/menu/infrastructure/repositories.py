@@ -21,6 +21,8 @@ from restaurante.modules.kitchen.infrastructure.models import ProductStationMode
 from restaurante.modules.menu.domain.entities import (
     Addon,
     Category,
+    OrderableProduct,
+    OrderableVariant,
     Product,
     ProductPrice,
     ProductVariant,
@@ -711,3 +713,116 @@ class SqlAlchemyMenuRepository:
         await self._session.commit()
         await self._session.refresh(model)
         return dict(model.config)
+
+    async def list_orderable(
+        self, tenant_id: uuid.UUID, branch_id: uuid.UUID
+    ) -> list[OrderableProduct]:
+        """Lo que se puede pedir HOY en esa sede, con el precio de cada variante ya resuelto.
+
+        **Tres consultas, no una por producto.** Es el punto entero del método: la comanda pedía
+        `products`, luego un `listProductPrices` por producto y un `listVariants` por producto —
+        unas 81 peticiones para pintar unos mosaicos. Y el store del menú llevaba su propio
+        diagnóstico: *"The backend has no bulk price endpoint"*. Este es ese endpoint.
+
+        Sólo devuelve lo VENDIBLE, y eso es una decisión y no un filtro de conveniencia: un
+        producto sin precio en la sede lo rechaza `add_item`, así que enseñarlo como mosaico sería
+        ofrecer algo que al tocarlo da error. Igual con uno cuyas variantes estén todas inactivas.
+
+        El precio de cada variante sale de la MISMA aritmética que cobra `add_item` —precio de sede
+        más la suma de las opciones compuestas—. No se recompone en el cliente: dos fórmulas para
+        el mismo número es exactamente el bug que este change cerró.
+        """
+        # 1. Productos activos con precio activo en esa sede.
+        priced = (
+            await self._session.execute(
+                select(
+                    ProductModel.id,
+                    ProductModel.category_id,
+                    ProductModel.name,
+                    ProductPriceModel.price,
+                )
+                .join(
+                    ProductPriceModel,
+                    ProductPriceModel.product_id == ProductModel.id,
+                )
+                .where(
+                    ProductModel.tenant_id == tenant_id,
+                    ProductModel.is_active.is_(True),
+                    ProductPriceModel.tenant_id == tenant_id,
+                    ProductPriceModel.branch_id == branch_id,
+                    ProductPriceModel.is_active.is_(True),
+                )
+                .order_by(ProductModel.name)
+            )
+        ).all()
+        if not priced:
+            return []
+        base_by_product = {row[0]: Decimal(row[3]) for row in priced}
+
+        # 2. Sus variantes activas.
+        variants = (
+            await self._session.execute(
+                select(
+                    ProductVariantModel.id,
+                    ProductVariantModel.product_id,
+                    ProductVariantModel.name,
+                )
+                .where(
+                    ProductVariantModel.tenant_id == tenant_id,
+                    ProductVariantModel.product_id.in_(list(base_by_product)),
+                    ProductVariantModel.is_active.is_(True),
+                )
+                .order_by(ProductVariantModel.name)
+            )
+        ).all()
+        if not variants:
+            return []
+
+        # 3. El recargo de cada una, agregado de sus opciones compuestas.
+        surcharge_rows = (
+            (
+                await self._session.execute(
+                    select(
+                        ProductVariantOptionModel.product_variant_id,
+                        func.coalesce(func.sum(VariantOptionModel.extra_price), 0),
+                    )
+                    .join(
+                        VariantOptionModel,
+                        VariantOptionModel.id
+                        == ProductVariantOptionModel.variant_option_id,
+                    )
+                    .where(
+                        ProductVariantOptionModel.tenant_id == tenant_id,
+                        ProductVariantOptionModel.product_variant_id.in_(
+                            [v[0] for v in variants]
+                        ),
+                    )
+                    .group_by(ProductVariantOptionModel.product_variant_id)
+                )
+            ).all()
+        )
+        surcharges: dict[uuid.UUID, Decimal] = {
+            row[0]: Decimal(row[1]) for row in surcharge_rows
+        }
+
+        by_product: dict[uuid.UUID, list[OrderableVariant]] = {}
+        for variant_id, product_id, name in variants:
+            by_product.setdefault(product_id, []).append(
+                OrderableVariant(
+                    id=variant_id,
+                    name=name,
+                    price=base_by_product[product_id]
+                    + Decimal(surcharges.get(variant_id, 0)),
+                )
+            )
+
+        return [
+            OrderableProduct(
+                id=row[0],
+                category_id=row[1],
+                name=row[2],
+                variants=by_product[row[0]],
+            )
+            for row in priced
+            if row[0] in by_product
+        ]

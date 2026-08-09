@@ -124,6 +124,80 @@ class BridgeWhatsAppGateway:
         )
         return _extract_message_id(data_out)
 
+    async def publish_status(
+        self,
+        session: WhatsAppSession,
+        jids: list[str],
+        *,
+        status_type: str,
+        content: str,
+        bg_color: str | None = None,
+        font: int | None = None,
+        caption: str | None = None,
+    ) -> str | None:
+        """Evolution v2: `POST /message/sendStatus/{instance}`.
+
+        Leído de su código, no de memoria: `src/api/routes/sendMessage.router.ts` (la ruta),
+        `src/api/dto/sendMessage.dto.ts` (`SendStatusDto`) y
+        `src/api/integrations/channel/whatsapp/whatsapp.baileys.service.ts` (`formatStatusMessage`,
+        que es donde están las exigencias).
+
+        Tres cosas del proveedor que hay que saber para leer esto:
+
+        1. **Un estado de texto EXIGE `backgroundColor` y `font`** o devuelve 400
+           (`formatStatusMessage`). Por eso se validan al guardar y aquí sólo se envían.
+        2. **`statusJidList` es obligatorio** si no se manda `allContacts: true`. Nosotros nunca
+           mandamos `allContacts`: eso lee la tabla de contactos DE EVOLUTION, de tamaño
+           desconocido, y sobre ella nuestro opt-out y nuestra ventana de inactividad no tienen
+           ningún efecto. Es exactamente el botón que quema el número.
+        3. **El puente parte la lista en tandas de diez por dentro** y las reenvía con el mismo
+           `messageId`, dentro de un `Promise.allSettled`. La consecuencia hay que tenerla escrita:
+           **un 201 no significa que llegó a todos.** Si la tanda 7 de 20 falla, se la come y
+           devuelve el mensaje de la primera. Por eso el id que sale de aquí es el de la primera
+           tanda y nada más, y por eso este módulo nunca puede afirmar cuántos lo recibieron.
+
+        La imagen va como URL y no en base64 —al contrario que `send_media`— porque un estado con
+        imagen ya tiene su archivo en R2 con una URL pública: meter sus bytes en este proceso y en
+        este cliente httpx sería memoria y latencia por nada.
+        """
+        if not self._base_url:
+            raise MessageDeliveryError(
+                "El puente de WhatsApp no está configurado (WHATSAPP_BRIDGE_BASE_URL)."
+            )
+        if not jids:
+            # Nunca debería llegar aquí: quien llama ya sabe si la audiencia está vacía, y
+            # publicar a nadie no es un caso a soportar sino una llamada que sobra.
+            raise MessageDeliveryError("Un estado necesita al menos un destinatario.")
+
+        payload: dict[str, Any] = {
+            "type": status_type,
+            "content": content,
+            "statusJidList": jids,
+        }
+        if bg_color is not None:
+            payload["backgroundColor"] = bg_color
+        if font is not None:
+            payload["font"] = font
+        if caption:
+            payload["caption"] = caption
+
+        data = await self._request(
+            "POST", f"/message/sendStatus/{session.provider_instance_ref}", json=payload
+        )
+        # A diferencia de un mensaje, aquí el id es prescindible: sirve para correlacionar, no para
+        # reconciliar nada —un estado no tiene acuses que emparejar—. `_extract_message_id` devuelve
+        # cadena vacía cuando no lo encuentra; se traduce a `None` porque "no lo sabemos" y "es la
+        # cadena vacía" son cosas distintas, y la columna es nullable justamente para poder decirlo.
+        message_id = _extract_message_id(data)
+        if not message_id:
+            logger.info(
+                "El puente aceptó el estado sin devolver id (tenant=%s, branch=%s)",
+                session.tenant_id,
+                session.branch_id,
+            )
+            return None
+        return message_id
+
     async def fetch_media(
         self,
         session: WhatsAppSession,

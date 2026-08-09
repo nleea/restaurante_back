@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Annotated, Any
 
@@ -19,11 +19,17 @@ from restaurante.modules.messaging.domain.entities import (
     AutoreplySettings,
     FaqEntry,
     QuickReply,
+    StatusPublication,
+    WhatsAppStatus,
 )
 from restaurante.modules.messaging.domain.ports import ConversationSummary
 from restaurante.modules.messaging.domain.quick_reply import (
     MAX_QUICK_REPLY_CHARS,
     MAX_QUICK_REPLY_NAME_CHARS,
+)
+from restaurante.modules.messaging.domain.status_audience import (
+    StatusAudience,
+    publication_calls,
 )
 from restaurante.shared.domain.order_label import order_label
 
@@ -117,12 +123,21 @@ class MessageResponse(BaseModel):
     proof_of_order: str | None = None
 
 
+class StatusOptOutRequest(BaseModel):
+    """Marcar o desmarcar que este contacto no quiere recibir estados."""
+
+    opted_out: bool
+
+
 class ThreadResponse(BaseModel):
     id: uuid.UUID
     branch_id: uuid.UUID
     contact_id: uuid.UUID
     contact_name: str | None
     contact_phone: str
+    # Si este contacto pidió no recibir estados. Viaja en el hilo y no en la lista de la bandeja
+    # porque el interruptor vive en el hilo: es donde llega la petición y donde está quien la lee.
+    contact_status_opt_out: bool
     status: str
     employee_id: uuid.UUID | None
     holder_name: str | None
@@ -139,6 +154,7 @@ class ThreadResponse(BaseModel):
             contact_id=thread.contact.id,
             contact_name=thread.contact.name,
             contact_phone=thread.contact.phone,
+            contact_status_opt_out=thread.contact.status_opt_out,
             status=c.status,
             employee_id=c.employee_id,
             holder_name=thread.holder_name,
@@ -662,3 +678,139 @@ def session_response(session: Any) -> SessionResponse:
         phone_number=session.phone_number,
         last_seen_at=session.last_seen_at,
     )
+
+
+# --- Estados programados ----------------------------------------------------
+class StatusSlotSchema(BaseModel):
+    """Una franja: un día de la semana O una fecha, más la hora en minutos locales.
+
+    El contrato deja los dos campos opcionales porque exactamente uno va puesto, y cuál de los dos
+    es lo que distingue "todos los viernes" de "el 15". Validarlo aquí con un `model_validator`
+    sería un tercer sitio donde vive la misma regla —ya está en el dominio y como CHECK en la base—,
+    así que se deja pasar y la valida `validate_slots`, que es quien da el 422 con el número de la
+    franja culpable.
+    """
+
+    minute: int
+    weekday: int | None = None
+    on_date: date | None = None
+
+
+class StatusRequest(BaseModel):
+    """Guardar un estado. `slots` viaja entero: es un horario, no una lista a la que se añade."""
+
+    type: str
+    content: str
+    slots: list[StatusSlotSchema] = Field(default_factory=list)
+    bg_color: str | None = None
+    font: int | None = None
+    caption: str | None = None
+    media_url: str | None = None
+    active: bool = True
+
+
+class StatusResponse(BaseModel):
+    id: uuid.UUID
+    branch_id: uuid.UUID
+    type: str
+    content: str
+    slots: list[StatusSlotSchema]
+    bg_color: str | None
+    font: int | None
+    caption: str | None
+    media_url: str | None
+    active: bool
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_status(cls, status: WhatsAppStatus) -> StatusResponse:
+        return cls(
+            id=status.id,
+            branch_id=status.branch_id,
+            type=status.type,
+            content=status.content,
+            slots=[
+                StatusSlotSchema(
+                    minute=s.minute, weekday=s.weekday, on_date=s.on_date
+                )
+                for s in status.slots
+            ],
+            bg_color=status.bg_color,
+            font=status.font,
+            caption=status.caption,
+            media_url=status.media_url,
+            active=status.active,
+            created_at=status.created_at,
+            updated_at=status.updated_at,
+        )
+
+
+class AudiencePreviewResponse(BaseModel):
+    """La audiencia y sus cuatro bajas, para enseñarlas ANTES de programar.
+
+    `addressed` es "a cuántos se dirigiría". Las cuatro exclusiones van sueltas y no sumadas porque
+    un total no responde la única pregunta que importa —*por qué* bajó de 340 a 200— y
+    `excluded_by_cap > 0` es lo único que distingue "esto llega a todos los que puede" de "esto se
+    truncó". No hay ningún campo de vistas ni de entregados: no se pueden saber.
+    """
+
+    addressed: int
+    total_candidates: int
+    excluded_no_number: int
+    excluded_opted_out: int
+    excluded_inactive: int
+    excluded_by_cap: int
+    provider_calls: int
+
+    @classmethod
+    def from_audience(cls, audience: StatusAudience) -> AudiencePreviewResponse:
+        return cls(
+            addressed=audience.addressed_count,
+            total_candidates=audience.total_candidates,
+            excluded_no_number=audience.excluded_no_number,
+            excluded_opted_out=audience.excluded_opted_out,
+            excluded_inactive=audience.excluded_inactive,
+            excluded_by_cap=audience.excluded_by_cap,
+            # Cuántas llamadas a `status@broadcast` costaría. Es el número que mide el riesgo, y va
+            # en el contrato para que la pantalla pueda enseñarlo en vez de esconderlo.
+            provider_calls=publication_calls(audience.addressed_count),
+        )
+
+
+class PublicationResponse(BaseModel):
+    """Qué pasó cuando venció una franja. Lo que se INTENTÓ."""
+
+    id: uuid.UUID
+    fired_for_date: date
+    minute: int
+    state: str
+    addressed_count: int
+    excluded_no_number: int
+    excluded_opted_out: int
+    excluded_inactive: int
+    excluded_by_cap: int
+    late_by_minutes: int
+    created_at: datetime
+
+    @classmethod
+    def from_publication(cls, p: StatusPublication) -> PublicationResponse:
+        return cls(
+            id=p.id,
+            fired_for_date=p.fired_for_date,
+            minute=p.minute,
+            state=p.state,
+            addressed_count=p.addressed_count,
+            excluded_no_number=p.excluded_no_number,
+            excluded_opted_out=p.excluded_opted_out,
+            excluded_inactive=p.excluded_inactive,
+            excluded_by_cap=p.excluded_by_cap,
+            late_by_minutes=p.late_by_minutes,
+            created_at=p.created_at,
+        )
+
+
+class StatusImageResponse(BaseModel):
+    """La URL pública de la imagen recién subida, para pegarla al estado al guardarlo."""
+
+    url: str

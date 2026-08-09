@@ -126,10 +126,15 @@ def _coord(value: Decimal) -> str:
 
 @dataclass
 class _ResolvedLine:
-    """A cart line proven valid, with the prices to charge, ready to persist."""
+    """A cart line proven valid, ready to persist.
+
+    **No lleva el precio del plato**, y eso es deliberado: lo resuelve `add_item` al escribir. Lo
+    que sí lleva son los precios de las ADICIONES, que siguen siendo del catálogo de adiciones y se
+    pasan explícitamente. Que aquí hubiera un `unit_price` era la copia que podía discrepar de la
+    que se cobra.
+    """
 
     command: OrderLineCommand
-    unit_price: Decimal
     addon_prices: list[tuple[uuid.UUID, Decimal]]
 
 
@@ -263,12 +268,13 @@ class StorefrontService:
             note = self._compose_note(
                 line.command.removed_ingredients, line.command.note
             )
+            # Sin precio: lo resuelve `add_item`, igual que para el salón. Eso es lo que hace que
+            # los dos canales cobren lo mismo — este camino no sumaba el recargo de la variante.
             item = await self._orders.add_item(
                 tenant_id,
                 order.id,
                 line.command.variant_id,
                 line.command.quantity,
-                line.unit_price,
                 notes=note,
             )
             assert item.id is not None
@@ -378,12 +384,13 @@ class StorefrontService:
             note = self._compose_note(
                 line.command.removed_ingredients, line.command.note
             )
+            # Sin precio: lo resuelve `add_item`, igual que para el salón. Eso es lo que hace que
+            # los dos canales cobren lo mismo — este camino no sumaba el recargo de la variante.
             item = await self._orders.add_item(
                 tenant_id,
                 order.id,
                 line.command.variant_id,
                 line.command.quantity,
-                line.unit_price,
                 notes=note,
             )
             assert item.id is not None
@@ -480,7 +487,14 @@ class StorefrontService:
                 raise ValidationError(
                     f"Variante no disponible: {line.variant_id}"
                 )
-            price = await self._repo.product_price(tenant_id, product_id, branch_id)
+            # Se comprueba que TENGA precio, sin quedárselo: cobrarlo es de `add_item`. La
+            # comprobación se hace aquí y no allí porque este método resuelve todo el carrito
+            # ANTES de abrir la comanda — sin ella, un producto sin precio en la sede fallaría a
+            # mitad del bucle y dejaría un pedido con la mitad de las líneas.
+            if await self._orders.line_price(tenant_id, line.variant_id, branch_id) is None:
+                raise ValidationError(
+                    f"Producto sin precio en esta sede: {line.variant_id}"
+                )
             addon_prices: list[tuple[uuid.UUID, Decimal]] = []
             for addon_id in line.addon_ids:
                 addon_price = await self._repo.addon_price(tenant_id, addon_id)
@@ -488,11 +502,7 @@ class StorefrontService:
                     raise ValidationError(f"Adición no disponible: {addon_id}")
                 addon_prices.append((addon_id, addon_price))
             resolved.append(
-                _ResolvedLine(
-                    command=line,
-                    unit_price=price if price is not None else Decimal(0),
-                    addon_prices=addon_prices,
-                )
+                _ResolvedLine(command=line, addon_prices=addon_prices)
             )
         return resolved
 

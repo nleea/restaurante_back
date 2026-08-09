@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
+
+from restaurante.modules.messaging.domain.status_schedule import StatusSlot
 
 
 @dataclass
@@ -36,6 +38,10 @@ class WhatsAppContact:
     updated_at: datetime
     name: str | None = None
     address: str | None = None
+    # "No me manden más estados". No afecta a NADA más: este contacto sigue siendo alcanzable para
+    # responderle, su hilo sigue en la bandeja y su historial no se toca. Es lo que lo separa de
+    # borrar el contacto, que era la única forma de sacar a alguien de la lista antes de existir.
+    status_opt_out: bool = False
 
 
 @dataclass
@@ -118,6 +124,57 @@ class AutoreplySettings:
     # y nada más, así que `None` le llega como lista vacía.
     quick_replies: list[QuickReply] | None = None
     id: uuid.UUID | None = None
+
+
+@dataclass
+class WhatsAppStatus:
+    """Un estado programado: la tarjeta y sus franjas.
+
+    Las franjas viajan DENTRO del estado y no como una lista aparte porque son su horario, no una
+    relación con vida propia: ninguna operación quiere un estado sin saber cuándo sale, ni una
+    franja sin saber de quién es. Y no hay campo `kind`: las franjas SON el horario (ver
+    `domain/status_schedule.py`).
+    """
+
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    branch_id: uuid.UUID
+    type: str
+    content: str
+    created_at: datetime
+    updated_at: datetime
+    slots: list[StatusSlot] = field(default_factory=list)
+    # Obligatorios para el tipo texto (el proveedor devuelve 400 sin ellos), nulos para imagen.
+    bg_color: str | None = None
+    font: int | None = None
+    caption: str | None = None
+    media_url: str | None = None
+    active: bool = True
+    created_by: uuid.UUID | None = None
+
+
+@dataclass
+class StatusPublication:
+    """Qué pasó cuando venció una franja. Lo que se INTENTÓ, no lo que llegó.
+
+    `addressed_count` es "a cuántos se dirigió". El nombre es la defensa: el proveedor no devuelve
+    vistas y devuelve 201 aunque se le caigan tandas, así que cualquier lectura como "le llegó a N"
+    es falsa, y de ahí a una pantalla que dice "visto por N" hay un solo paso.
+    """
+
+    id: uuid.UUID
+    whatsapp_status_id: uuid.UUID
+    fired_for_date: date
+    minute: int
+    state: str
+    created_at: datetime
+    addressed_count: int = 0
+    excluded_no_number: int = 0
+    excluded_opted_out: int = 0
+    excluded_inactive: int = 0
+    excluded_by_cap: int = 0
+    late_by_minutes: int = 0
+    provider_message_id: str | None = None
 
 
 @dataclass
