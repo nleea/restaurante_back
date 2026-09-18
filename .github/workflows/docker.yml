@@ -59,3 +59,37 @@ jobs:
             ${{ env.DOCKER_USER }}/${{ env.IMAGE_NAME }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # GitOps: fija la version recien publicada en los manifiestos del repo de
+      # despliegue (nleea/restaurante-ops). ArgoCD observa `k8s/` ahi y sincroniza
+      # el cambio al cluster. Sin este paso el manifiesto seguiria apuntando a
+      # `latest`, ArgoCD no veria ninguna revision nueva y el despliegue no saldria.
+      #
+      # La imagen del backend la usan la API Y los dos workers (workers.yaml), asi
+      # que hay que reescribir los tres sitios a la vez: actualizar solo uno
+      # desplegaria una API nueva con workers viejos (o al reves).
+      #
+      # Requiere el secret GITOPS_TOKEN: un PAT con permiso de escritura sobre
+      # nleea/restaurante-ops (el GITHUB_TOKEN por defecto solo alcanza este repo).
+      - name: Actualizar la version en el repo GitOps
+        env:
+          GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          IMAGE="${DOCKER_USER}/${IMAGE_NAME}"
+          git clone \
+            "https://x-access-token:${GITOPS_TOKEN}@github.com/nleea/restaurante-ops.git" \
+            "$RUNNER_TEMP/gitops"
+          cd "$RUNNER_TEMP/gitops"
+          sed -i -E "s#${IMAGE}:[A-Za-z0-9._-]+#${IMAGE}:${VERSION}#g" \
+            k8s/backend.yaml k8s/workers.yaml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "Los manifiestos ya apuntan a ${VERSION}; nada que actualizar."
+            exit 0
+          fi
+          git commit -am "chore(deploy): backend ${VERSION}"
+          git pull --rebase origin main
+          git push origin main
