@@ -141,15 +141,17 @@ ASSISTANT_OFFER = "\n\nEscribe *1* si prefieres que te atienda nuestro asistente
 # el saludo, el asistente y las FAQs no contestaron. Existe porque el silencio se lee como que lo
 # ignoran, y esa lectura cuesta más que un mensaje.
 #
-# Por PALABRA y no por número, y eso es deliberado: el saludo del asistente ofrece "escribe 1", así
-# que un menú numerado competiría por el mismo "1". Las palabras no chocan con nada. Los números
-# sí se aceptan, pero **sólo si el mensaje ES el número** — ver `_menu_option`—: como palabra
-# suelta, "2" haría que "quiero 2 hamburguesas" se leyera como una consulta de estado.
+# Por NÚMERO, y no por palabra, y eso es deliberado. Los botones interactivos de WhatsApp no
+# existen aquí: el puente es no oficial y WhatsApp los tiene deshabilitados para números no
+# verificados, y las plantillas de verdad exigen trámite en Meta por cada tenant. Responder con un
+# número es lo que hace todo el mundo en WhatsApp Business, funciona en cualquier cliente y sigue
+# funcionando el día que haya API oficial. Las PALABRAS también se aceptan —ver `_menu_option`—,
+# porque quien escribe "estado" está pidiendo lo mismo que quien escribe "2".
 DEFAULT_OPTIONS_MENU = (
     "¡Con gusto! Dime qué necesitas:\n\n"
-    "• *pedido* — hacer un pedido nuevo\n"
-    "• *estado* — ver cómo va mi pedido\n"
-    "• *persona* — hablar con alguien del equipo"
+    "*1* — Hacer un pedido nuevo\n"
+    "*2* — Ver cómo va mi pedido\n"
+    "*3* — Hablar con alguien del equipo"
 )
 
 # Las opciones del menú. El orden de comprobación es el diseño: "persona" gana —quien pide una
