@@ -55,6 +55,10 @@ ORDER_PLACEHOLDERS: frozenset[str] = IDENTITY_PLACEHOLDERS | {
 # `{next_opening}` salta por diseño las aperturas de hoy que ya pasaron, así que una FAQ de
 # horario contestada a las 2 de la tarde diría "abrimos mañana a las 8:00" — cierto e inútil.
 FAQ_PLACEHOLDERS: frozenset[str] = GREETING_PLACEHOLDERS | {"hours_line"}
+# El menú de opciones que sale tras un mensaje que el saludo, el asistente y las FAQs no
+# contestaron. Lleva la identidad y el enlace a la carta: la opción "haz un pedido" apunta ahí.
+# Nada de `{hours_line}` ni de `{order_*}`: es una lista de opciones, no la respuesta a una.
+MENU_PLACEHOLDERS: frozenset[str] = IDENTITY_PLACEHOLDERS | {"menu_link"}
 # La tercera variante del saludo SÍ puede nombrar el pedido: existe precisamente porque hay uno
 # esperando pago, y decir "tu pedido A3F2 por $46.000" es lo que le dice al agente —y al cliente—
 # de qué se está hablando. Sin `{order_items}`: el saludo no es un catálogo.

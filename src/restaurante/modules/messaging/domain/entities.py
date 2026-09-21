@@ -109,6 +109,10 @@ class AutoreplySettings:
     # El saludo de quien tiene un pedido esperando pago. Vacío = usar el de abierto/cerrado.
     greeting_awaiting_payment_text: str = ""
     assistant_offer_enabled: bool = False
+    # El menú de opciones que sale cuando el saludo, el asistente y las FAQs no contestaron.
+    # Apagado por defecto; `menu_text` vacío usa el texto de fábrica.
+    menu_enabled: bool = False
+    menu_text: str = ""
     idle_hours: int = 24
     token_lifetime_hours: int = 24
     # {"order_received": {"enabled": bool, "text": str}, …}

@@ -97,6 +97,13 @@ EMISSION_STATUS = "status"
 # contestación. Con cuatro FAQs, el techo son cuatro automáticos por conversación — el mismo
 # orden de magnitud que el mapeo de estados por pedido.
 EMISSION_FAQ = "faq"
+# El menú de opciones: una vez por conversación, como el saludo. Es lo que sale cuando el cliente
+# escribió algo que el saludo, el asistente y las FAQs no contestaron. Repetirlo en cada mensaje
+# no entendido es la conducta que convierte un chat en un bucle y hace que silencien el número.
+EMISSION_MENU = "menu"
+# La respuesta a una opción del menú. Una por (conversación, opción): elegir "estado" dos veces
+# recibe una respuesta, igual que una FAQ. El nombre de la opción viaja en `detail`.
+EMISSION_MENU_OPTION = "menu_option"
 # Una emisión por solicitud de pago, no por pedido: re-cotizar un domicilio acuña una solicitud
 # nueva y esa SÍ debe salir. El id de la solicitud viaja en `detail` y es lo que las separa.
 EMISSION_PAYMENT_REQUEST = "payment_request"
@@ -288,6 +295,18 @@ class WhatsAppAutoreplySettingsModel(Base, TenantScopedMixin, TimestampMixin):
     # el asistente, esta línea se omite y "quiero hablar con alguien" va al inbox humano.
     assistant_offer_enabled: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False
+    )
+    # El menú de opciones: la respuesta que sale cuando el cliente escribió algo que el saludo,
+    # el asistente y las FAQs no contestaron. Existe para que un mensaje en un chat abierto nunca
+    # se quede sin respuesta — que el cliente lo lea como que lo ignoran es peor que un menú.
+    #
+    # Apagado por defecto, la misma regla que el saludo y las FAQs: instalar este change no puede
+    # cambiarle el canal a nadie. `menu_text` vacío usa el texto de fábrica.
+    menu_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
+    menu_text: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default=""
     )
     idle_hours: Mapped[int] = mapped_column(Integer, default=24, nullable=False)
     token_lifetime_hours: Mapped[int] = mapped_column(
