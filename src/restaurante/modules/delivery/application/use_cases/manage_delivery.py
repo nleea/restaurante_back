@@ -988,10 +988,10 @@ class DeliveryService:
         run = await self.create_run(tenant_id, route.id, employee_id)
         assert run.id is not None
         # Pull the branch's pending, unassigned deliveries — regardless of zone/route.
-        pending = await self._repo.list_deliveries(tenant_id, branch_id, status=D_PENDING)
-        for delivery in pending:
-            if delivery.delivery_run_id is None and delivery.id is not None:
-                await self.assign_delivery(tenant_id, delivery.id, run.id)
+        # pending = await self._repo.list_deliveries(tenant_id, branch_id, status=D_PENDING)
+        # for delivery in pending:
+        #     if delivery.delivery_run_id is None and delivery.id is not None:
+        #         await self.assign_delivery(tenant_id, delivery.id, run.id)
         await self._publish(tenant_id, branch_id, "status")
         return await self._enrich_run(tenant_id, run)
 
