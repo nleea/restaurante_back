@@ -280,10 +280,19 @@
 
 ## 7. Despliegue, en este orden
 
-- [ ] 7.1 **Backend primero.** Acepta el `unit_price` viejo como campo ignorado, así que un frontend
+- [x] 7.1 **Backend primero.** Acepta el `unit_price` viejo como campo ignorado, así que un frontend
       antiguo contra un backend nuevo sigue funcionando — y empieza a cobrar bien
+      → PR del backend abierto: nleea/restaurante_back#5. **Los dos changes van en commits
+      separados** (`a1d94b4` estados, `8266bb5` precios) porque el árbol los tenía mezclados y un
+      blob habría hecho imposible revertir uno sin el otro. Cada commit verificado AISLADO antes de
+      crearlo (520 y 407 pruebas). La migración 0047 la aplica el `initContainer`
+      (`k8s/backend.yaml:85`), así que no hay paso manual.
+      ⚠️ **El rollout no lo puedo hacer yo**: `kubectl` no tiene contexto configurado aquí
 - [ ] 7.2 **Frontend después.** Al revés (frontend nuevo contra backend viejo) se escriben ceros: es la
       única forma de romper esto y se evita con el orden
+      → rama empujada (`9b19e7a`) y **el PR NO está abierto a propósito**: abrirlo invita a que
+      alguien lo mergee antes de que el backend esté vivo, y eso es exactamente el único modo de
+      romper este change. Se abre cuando el backend esté desplegado y comprobado
 - [ ] 7.3 Dejar el `unit_price` tolerado hasta que el frontend esté desplegado en todos los tenants;
       quitarlo es un commit de limpieza posterior, no parte de esto
 
