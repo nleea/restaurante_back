@@ -147,9 +147,9 @@ async def test_an_unmatched_message_gets_the_menu(
 
     assert len(fake_bridge.sent) == 2  # saludo + menú
     _phone, text = fake_bridge.sent[-1]
-    assert "pedido" in text
-    assert "estado" in text
-    assert "persona" in text
+    assert "*1*" in text
+    assert "*2*" in text
+    assert "*3*" in text
 
 
 async def test_the_first_message_only_gets_the_greeting(
@@ -331,7 +331,7 @@ async def test_a_number_inside_a_sentence_is_not_an_option(
 
     _phone, text = fake_bridge.sent[-1]
     assert "No encuentro pedidos" not in text
-    assert "estado" in text  # el menú, no una opción
+    assert "Dime qué necesitas" in text  # el menú, no una opción
 
 
 async def test_a_lone_number_is_an_option(client: AsyncClient, fake_bridge) -> None:
@@ -374,7 +374,7 @@ async def test_the_menu_works_without_a_greeting(
     await post_inbound(client, "inst-centro", message_id="m-1", text="quiero una hamburguesa")
 
     assert len(fake_bridge.sent) == 1
-    assert "estado" in fake_bridge.sent[-1][1]
+    assert "*2*" in fake_bridge.sent[-1][1]
 
 
 async def test_an_option_works_without_a_greeting(
