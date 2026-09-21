@@ -36,6 +36,8 @@ def _payload(**over: Any) -> dict[str, Any]:
         "greeting_open_text": "Hola, soy {branch_name}. Carta: {menu_link}",
         "greeting_closed_text": "Cerrados; abrimos {next_opening}. {menu_link}",
         "assistant_offer_enabled": False,
+        "menu_enabled": False,
+        "menu_text": "",
         "idle_hours": 24,
         "token_lifetime_hours": 24,
         "status_mapping": {},
@@ -57,6 +59,7 @@ async def test_a_tenant_without_a_row_reads_everything_off(
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["settings"]["greeting_enabled"] is False
+    assert body["settings"]["menu_enabled"] is False
     assert body["settings"]["status_mapping"] == {}
     # El mapeo de fábrica SÍ viaja, para que la pantalla pueda ofrecerlo sin inventarlo.
     defaults = body["default_status_mapping"]
@@ -64,6 +67,10 @@ async def test_a_tenant_without_a_row_reads_everything_off(
     assert defaults["ready"]["enabled"] is False
     assert "menu_link" in body["greeting_placeholders"]
     assert "order_total" in body["order_placeholders"]
+    # El menú tiene sus marcadores y su texto de fábrica, para que el editor no los invente.
+    assert "menu_link" in body["menu_placeholders"]
+    assert "order_total" not in body["menu_placeholders"]
+    assert body["default_menu_text"]
     # Y `{menu_link}` NO es válido en un aviso de pedido: saldría con un hueco.
     assert "menu_link" not in body["order_placeholders"]
     # Desde `assistant-core` esto ya no es "no existe para nadie": es si este DESPLIEGUE
@@ -87,6 +94,22 @@ async def test_settings_round_trip(client: AsyncClient) -> None:
     reread = (await client.get("/messaging/autoreply", headers=headers)).json()
     assert reread["settings"]["greeting_enabled"] is True
     assert reread["settings"]["idle_hours"] == 6
+
+
+async def test_the_menu_settings_round_trip(client: AsyncClient) -> None:
+    await grant_only(["messaging.manage"])
+    headers = await login(client)
+
+    saved = await client.put(
+        "/messaging/autoreply",
+        headers=headers,
+        json=_payload(menu_enabled=True, menu_text="Elige:\n{menu_link}"),
+    )
+    assert saved.status_code == 200, saved.text
+
+    reread = (await client.get("/messaging/autoreply", headers=headers)).json()
+    assert reread["settings"]["menu_enabled"] is True
+    assert reread["settings"]["menu_text"] == "Elige:\n{menu_link}"
 
 
 # --- Validación de marcadores -----------------------------------------------
@@ -118,6 +141,23 @@ async def test_an_order_placeholder_is_rejected_in_the_greeting(
         "/messaging/autoreply",
         headers=headers,
         json=_payload(greeting_open_text="Hola, van {order_total}"),
+    )
+
+    assert resp.status_code == 422
+    assert "{order_total}" in resp.json()["detail"]
+
+
+async def test_an_order_placeholder_is_rejected_in_the_menu(
+    client: AsyncClient,
+) -> None:
+    """El menú ofrece opciones, no habla de un pedido: `{order_total}` saldría con un hueco."""
+    await grant_only(["messaging.manage"])
+    headers = await login(client)
+
+    resp = await client.put(
+        "/messaging/autoreply",
+        headers=headers,
+        json=_payload(menu_enabled=True, menu_text="Tu pedido: {order_total}"),
     )
 
     assert resp.status_code == 422

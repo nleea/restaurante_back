@@ -93,6 +93,30 @@ class OrderLineSummary:
 
 
 @dataclass(frozen=True)
+class ContactOrder:
+    """El pedido más reciente de un contacto, con lo justo para contarle cómo va.
+
+    No es `OrderContext`: aquél sirve para DIRIGIR un aviso (a quién y por cuánto) y este para
+    CONTESTAR una consulta ("¿cómo va mi pedido?"). Por eso éste sí trae los estados.
+
+    Todo sale de una sola lectura y sin derivar el "estado de cliente" completo, que es una regla
+    de `orders`: replicarla aquí sería una segunda verdad que se quedaría vieja. Con estos campos
+    se redacta una frase honesta sin inventar nada.
+    """
+
+    order_id: uuid.UUID
+    total: Decimal
+    paid: Decimal
+    status: str
+    kitchen_state: str
+    delivery_status: str | None = None
+
+    @property
+    def balance(self) -> Decimal:
+        return self.total - self.paid
+
+
+@dataclass(frozen=True)
 class UnsettledOrder:
     """Un pedido de este contacto al que todavía le falta plata.
 
@@ -415,6 +439,18 @@ class MessagingRepository(Protocol):
 
         Lo pregunta el gate de las FAQs: quien está a mitad de un pedido no está haciendo una
         pregunta general, y contestarle un folleto es el peor resultado posible.
+        """
+        ...
+
+    async def latest_order_for_contact(
+        self, tenant_id: uuid.UUID, contact_id: uuid.UUID, *, since: datetime
+    ) -> ContactOrder | None:
+        """El pedido más reciente de este contacto, o None si no tiene ninguno reciente.
+
+        Lo usa la opción "estado de mi pedido" del menú. A diferencia de `has_live_order` no filtra
+        por estado: un pedido recién entregado o cancelado también es lo que el cliente quiere
+        leer si pregunta por él. La ventana es la de inactividad, la misma pregunta de siempre
+        —"¿esto sigue vivo?"— contestada con el número que el dueño ya configuró.
         """
         ...
 

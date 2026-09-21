@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from restaurante.modules.business.infrastructure.models import OperatingHoursModel
 from restaurante.modules.customers.infrastructure.models import CustomerModel
+from restaurante.modules.delivery.infrastructure.models import OrderDeliveryModel
 from restaurante.modules.identity.infrastructure.models import PersonModel, UserModel
 from restaurante.modules.menu.infrastructure.models import (
     ProductModel,
@@ -43,6 +44,7 @@ from restaurante.modules.messaging.domain.entities import (
 )
 from restaurante.modules.messaging.domain.ports import (
     BusinessIdentity,
+    ContactOrder,
     ConversationSummary,
     OrderContext,
     OrderLineSummary,
@@ -121,6 +123,8 @@ def _settings(m: WhatsAppAutoreplySettingsModel) -> AutoreplySettings:
         greeting_closed_text=m.greeting_closed_text,
         greeting_awaiting_payment_text=m.greeting_awaiting_payment_text,
         assistant_offer_enabled=m.assistant_offer_enabled,
+        menu_enabled=m.menu_enabled,
+        menu_text=m.menu_text,
         idle_hours=m.idle_hours,
         token_lifetime_hours=m.token_lifetime_hours,
         status_mapping=dict(m.status_mapping or {}),
@@ -865,6 +869,8 @@ class SqlAlchemyMessagingRepository:
         row.greeting_closed_text = settings.greeting_closed_text
         row.greeting_awaiting_payment_text = settings.greeting_awaiting_payment_text
         row.assistant_offer_enabled = settings.assistant_offer_enabled
+        row.menu_enabled = settings.menu_enabled
+        row.menu_text = settings.menu_text
         row.idle_hours = settings.idle_hours
         row.token_lifetime_hours = settings.token_lifetime_hours
         row.status_mapping = settings.status_mapping
@@ -1109,6 +1115,55 @@ class SqlAlchemyMessagingRepository:
             .limit(1)
         )
         return (await self._session.execute(stmt)).scalar_one_or_none() is not None
+
+    async def latest_order_for_contact(
+        self, tenant_id: uuid.UUID, contact_id: uuid.UUID, *, since: datetime
+    ) -> ContactOrder | None:
+        """El pedido más reciente de este contacto, con su estado de cocina y de domicilio.
+
+        Sin filtro de estado y con `LEFT JOIN` a la entrega: un pedido de mostrador no tiene fila
+        en `order_deliveries`, y un pedido entregado o cancelado también es lo que el cliente
+        quiere leer si pregunta por él. El importe pagado se calcula en una subconsulta
+        correlacionada, el mismo patrón que `unsettled_prepaid_order`.
+        """
+        paid = (
+            select(func.coalesce(func.sum(OrderPaymentModel.amount), 0))
+            .where(OrderPaymentModel.order_id == OrderModel.id)
+            .correlate(OrderModel)
+            .scalar_subquery()
+        )
+        stmt = (
+            select(
+                OrderModel.id,
+                OrderModel.total,
+                paid,
+                OrderModel.status,
+                OrderModel.kitchen_state,
+                OrderDeliveryModel.delivery_status,
+            )
+            .outerjoin(
+                OrderDeliveryModel, OrderDeliveryModel.order_id == OrderModel.id
+            )
+            .where(
+                OrderModel.tenant_id == tenant_id,
+                OrderModel.whatsapp_contact_id == contact_id,
+                OrderModel.created_at >= since,
+            )
+            .order_by(OrderModel.created_at.desc())
+            .limit(1)
+        )
+        row = (await self._session.execute(stmt)).first()
+        if row is None:
+            return None
+        order_id, total, paid_amount, status, kitchen_state, delivery_status = row
+        return ContactOrder(
+            order_id=order_id,
+            total=total,
+            paid=paid_amount,
+            status=status,
+            kitchen_state=kitchen_state,
+            delivery_status=delivery_status,
+        )
 
     async def order_context(
         self, tenant_id: uuid.UUID, order_id: uuid.UUID

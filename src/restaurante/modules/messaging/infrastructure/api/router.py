@@ -35,6 +35,7 @@ from restaurante.modules.identity.infrastructure.api.deps import (
     require_permission,
 )
 from restaurante.modules.messaging.application.use_cases.autoreply import (
+    DEFAULT_OPTIONS_MENU,
     DEFAULT_STATUS_MAPPING,
     SUGGESTED_FAQS,
     assistant_available,
@@ -50,6 +51,7 @@ from restaurante.modules.messaging.domain.templates import (
     AWAITING_PAYMENT_PLACEHOLDERS,
     FAQ_PLACEHOLDERS,
     GREETING_PLACEHOLDERS,
+    MENU_PLACEHOLDERS,
     ORDER_PLACEHOLDERS,
 )
 from restaurante.modules.messaging.infrastructure.api.deps import (
@@ -365,6 +367,8 @@ async def get_autoreply_settings(
         order_placeholders=sorted(ORDER_PLACEHOLDERS),
         faq_placeholders=sorted(FAQ_PLACEHOLDERS),
         awaiting_payment_placeholders=sorted(AWAITING_PAYMENT_PLACEHOLDERS),
+        menu_placeholders=sorted(MENU_PLACEHOLDERS),
+        default_menu_text=DEFAULT_OPTIONS_MENU,
         assistant_available=assistant_available(),
     )
 

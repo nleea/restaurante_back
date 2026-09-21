@@ -54,8 +54,11 @@ from restaurante.modules.messaging.domain.entities import (
 from restaurante.modules.messaging.domain.faq import (
     asks_for_a_person,
     first_match,
+    matches,
+    normalize,
     reserved_words_in,
 )
+from restaurante.modules.messaging.domain.order_status import customer_status_line
 from restaurante.modules.messaging.domain.ports import (
     BusinessIdentity,
     MessagingRepository,
@@ -67,6 +70,7 @@ from restaurante.modules.messaging.domain.templates import (
     AWAITING_PAYMENT_PLACEHOLDERS,
     FAQ_PLACEHOLDERS,
     GREETING_PLACEHOLDERS,
+    MENU_PLACEHOLDERS,
     ORDER_PLACEHOLDERS,
     find_placeholders,
     format_hours_line,
@@ -77,6 +81,8 @@ from restaurante.modules.messaging.domain.templates import (
 from restaurante.modules.messaging.infrastructure.models import (
     EMISSION_FAQ,
     EMISSION_GREETING,
+    EMISSION_MENU,
+    EMISSION_MENU_OPTION,
     EMISSION_PAYMENT_REQUEST,
     EMISSION_STATUS,
 )
@@ -105,6 +111,8 @@ logger = logging.getLogger(__name__)
 # Estado al que pasa una conversación tras saludarla. Es lo que impide saludar dos veces.
 STATUS_GREETED = "greeted"
 STATUS_NEW = "new"
+# La toma una persona. El menú manda aquí cuando el cliente pide hablar con alguien.
+STATUS_HUMAN = "human"
 
 # Textos por defecto. Un tenant que enciende el saludo sin escribir nada obtiene algo
 # presentable en vez de un mensaje vacío.
@@ -128,6 +136,45 @@ DEFAULT_GREETING_CLOSED = (
 # que ofrezca "escribe 1" deja al cliente escribiendo un 1 a las once de la noche al que no
 # contesta ni el bot ni una persona — que es exactamente lo que la oferta prometía evitar.
 ASSISTANT_OFFER = "\n\nEscribe *1* si prefieres que te atienda nuestro asistente."
+
+# El menú de opciones: lo que sale en una conversación abierta cuando el cliente escribió algo que
+# el saludo, el asistente y las FAQs no contestaron. Existe porque el silencio se lee como que lo
+# ignoran, y esa lectura cuesta más que un mensaje.
+#
+# Por PALABRA y no por número, y eso es deliberado: el saludo del asistente ofrece "escribe 1", así
+# que un menú numerado competiría por el mismo "1". Las palabras no chocan con nada. Los números
+# sí se aceptan, pero **sólo si el mensaje ES el número** — ver `_menu_option`—: como palabra
+# suelta, "2" haría que "quiero 2 hamburguesas" se leyera como una consulta de estado.
+DEFAULT_OPTIONS_MENU = (
+    "¡Con gusto! Dime qué necesitas:\n\n"
+    "• *pedido* — hacer un pedido nuevo\n"
+    "• *estado* — ver cómo va mi pedido\n"
+    "• *persona* — hablar con alguien del equipo"
+)
+
+# Las opciones del menú. El orden de comprobación es el diseño: "persona" gana —quien pide una
+# persona ya decidió que el bot no le sirve—, después "estado" y por último "pedido". El orden
+# importa porque "mi pedido" contiene "pedido": si se mirara "pedido" primero, una consulta de
+# estado recibiría el enlace de la carta.
+MENU_OPTION_PERSON = "person"
+MENU_OPTION_STATUS = "status"
+MENU_OPTION_ORDER = "order"
+
+_OPTION_STATUS_WORDS = (
+    "estado",
+    "mi pedido",
+    "mi orden",
+    "seguimiento",
+    "como va",
+)
+_OPTION_ORDER_WORDS = (
+    "pedido",
+    "pedir",
+    "nuevo pedido",
+    "hacer pedido",
+    "ordenar",
+    "carta",
+)
 
 # ¿Existe el asistente conversacional? Hoy no, para nadie: lo trae `assistant-core` (fase 4).
 #
@@ -326,6 +373,7 @@ class AutoreplyService:
             AWAITING_PAYMENT_PLACEHOLDERS,
             "saludo (esperando pago)",
         )
+        _reject_unknown(settings.menu_text, MENU_PLACEHOLDERS, "menú de opciones")
         for state, entry in settings.status_mapping.items():
             if state not in CUSTOMER_STATES:
                 raise ValidationError(f"Estado de pedido desconocido: {state}")
@@ -531,7 +579,12 @@ class AutoreplyService:
         contact_id: uuid.UUID,
         text: str,
     ) -> bool:
-        """Contesta una pregunta conocida. `True` si salió algo.
+        """Contesta una pregunta conocida. `True` si el mensaje ERA de las FAQs.
+
+        "Era suyo" y no "salió algo", y la diferencia es el menú de opciones: una pregunta
+        reconocida —aunque se calle a propósito por un pedido vivo, o porque ya se contestó— NO
+        debe caer al menú. Si cayera, un mensaje que sí entendimos recibiría "dime qué necesitas",
+        que es justo lo contrario de entenderlo. Sólo `None` en `first_match` devuelve `False`.
 
         El orden de las comprobaciones ES el diseño, y va de lo más barato a lo más caro:
 
@@ -573,7 +626,9 @@ class AutoreplyService:
                 faq.name,
                 conversation.id,
             )
-            return False
+            # Reconocida pero silenciada: se devuelve `True` para que no caiga al menú. El
+            # cliente está a mitad de un pedido, no perdido por el canal.
+            return True
 
         won = await self._repo.try_claim_emission(
             conversation.tenant_id,
@@ -583,7 +638,8 @@ class AutoreplyService:
             detail=faq.id,
         )
         if not won:
-            return False
+            # Ya se contestó (o lo está haciendo otro worker). Entendida: nada de menú.
+            return True
 
         return await self._send_and_record(
             conversation, contact_phone, await self._render_faq(conversation, faq)
@@ -654,6 +710,205 @@ class AutoreplyService:
             # excepción que `{order_items}`.
             values["hours_line"] = line or ""
         return render(faq.text, values)
+
+    # --- Menú de opciones ----------------------------------------------------
+    async def send_options_menu(
+        self,
+        conversation: WhatsAppConversation,
+        contact_phone: str,
+        *,
+        greeted_now: bool,
+    ) -> bool:
+        """Manda el menú de opciones una vez, si a esta conversación le toca.
+
+        Es la red que evita el silencio: una conversación `greeted` a la que el saludo, el
+        asistente y las FAQs no contestaron se quedaba muda, y el cliente lo lee como que lo
+        ignoran. Sale **una vez por conversación** —la constraint de emisión manda— porque
+        repetirlo en cada mensaje no entendido es lo que convierte el chat en un bucle.
+
+        Se calla, y cada silencio tiene su motivo:
+        - `greeted_now`: el saludo ACABA de salir por este mismo mensaje; dos automáticos por un
+          entrante es exactamente el volumen que hace que WhatsApp mire un número.
+        - `human`/`closed`: los atiende una persona, o el negocio dio el hilo por terminado.
+        - Apagado, sin URL pública de la carta, o cerrado con horario configurado.
+        """
+        if greeted_now:
+            return False
+        if conversation.status not in (STATUS_NEW, STATUS_GREETED):
+            return False
+        settings = await self.settings_for(conversation.tenant_id)
+        if not settings.menu_enabled:
+            return False
+        if not self._storefront_base_url:
+            # Mismo motivo que el saludo: sin base pública `{menu_link}` saldría relativo y no
+            # sería clicable. Mejor callar que mandar una ruta que no lleva a ninguna parte.
+            logger.warning(
+                "Menú no enviado: falta STOREFRONT_BASE_URL y el enlace a la carta saldría "
+                "relativo."
+            )
+            return False
+        if not await self._menu_time_ok(conversation):
+            return False
+
+        won = await self._repo.try_claim_emission(
+            conversation.tenant_id,
+            conversation.branch_id,
+            kind=EMISSION_MENU,
+            conversation_id=conversation.id,
+        )
+        if not won:
+            return False
+        text = await self._render_menu(conversation, settings)
+        return await self._send_and_record(conversation, contact_phone, text)
+
+    async def answer_menu_option(
+        self,
+        conversation: WhatsAppConversation,
+        contact_phone: str,
+        contact_id: uuid.UUID,
+        text: str,
+        *,
+        greeted_now: bool,
+    ) -> bool:
+        """Contesta la opción que el cliente eligió del menú. `True` si el mensaje era una opción.
+
+        Se acepta en los mismos estados en que el menú pudo haber salido —`greeted`, o `new` sin
+        saludo (tenant con el saludo apagado)—, y nunca en el mensaje que ACABA de disparar el
+        saludo: ahí el cliente todavía no vio ningún menú. En `bot` contesta el asistente y en
+        `human`/`closed` nadie.
+
+        La opción se reconoce por palabra completa, igual que las FAQs, y el orden de comprobación
+        vive en `_menu_option`.
+        """
+        active = conversation.status == STATUS_GREETED or (
+            conversation.status == STATUS_NEW and not greeted_now
+        )
+        if not active:
+            return False
+        message = text.strip()
+        if not message:
+            return False
+        settings = await self.settings_for(conversation.tenant_id)
+        # Sin menú encendido NO se interpretan opciones: "persona" y "pedido" tienen dueño en otras
+        # partes, y actuar sobre ellos aquí le cambiaría el canal a un tenant que no pidió esto.
+        if not settings.menu_enabled:
+            return False
+        option = _menu_option(message)
+        if option is None:
+            return False
+
+        # Una respuesta por (conversación, opción), como una FAQ. La constraint manda.
+        won = await self._repo.try_claim_emission(
+            conversation.tenant_id,
+            conversation.branch_id,
+            kind=EMISSION_MENU_OPTION,
+            conversation_id=conversation.id,
+            detail=option,
+        )
+        if not won:
+            # Se entendió, pero ya se contestó (o lo está haciendo otro worker). Se devuelve
+            # `True` para que NO caiga al menú: mandar el menú a quien repitió una opción que ya
+            # recibió es peor que no añadir nada.
+            return True
+
+        if option == MENU_OPTION_PERSON:
+            return await self._hand_to_person(conversation, contact_phone)
+        if option == MENU_OPTION_STATUS:
+            return await self._answer_order_status(
+                conversation, contact_phone, contact_id
+            )
+        return await self._answer_new_order(conversation, contact_phone)
+
+    async def _menu_time_ok(self, conversation: WhatsAppConversation) -> bool:
+        """¿Toca mandar el menú ahora?
+
+        Con horarios configurados y el negocio cerrado, no: el menú ofrece "haz un pedido" y
+        "estado de mi pedido" a alguien que a esas horas no puede recibir ninguna de las dos.
+        **Sin horarios cargados, sí**: no hay un "cerrado" que respetar, y callar por un dato
+        que nadie configuró es justo el silencio que este menú existe para evitar.
+        """
+        windows = [
+            HoursWindow(weekday=w, open_minute=o, close_minute=c)
+            for w, o, c in await self._repo.branch_hours(
+                conversation.tenant_id, conversation.branch_id
+            )
+        ]
+        if not windows:
+            return True
+        weekday, minute = weekday_and_minute()
+        return is_open_at(windows, weekday, minute)
+
+    async def _render_menu(
+        self, conversation: WhatsAppConversation, settings: AutoreplySettings
+    ) -> str:
+        identity = await self._repo.business_identity(
+            conversation.tenant_id, conversation.branch_id
+        )
+        values = {**_identity_values(identity)}
+        template = settings.menu_text or DEFAULT_OPTIONS_MENU
+        if "menu_link" in find_placeholders(template):
+            values["menu_link"] = await self.mint_store_link(conversation, settings)
+        return render(template, values)
+
+    async def _answer_new_order(
+        self, conversation: WhatsAppConversation, contact_phone: str
+    ) -> bool:
+        """La opción "haz un pedido": el enlace de la carta, con su token."""
+        if not self._storefront_base_url:
+            return False
+        link = await self.mint_store_link(conversation)
+        return await self._send_and_record(conversation, contact_phone, link)
+
+    async def _answer_order_status(
+        self,
+        conversation: WhatsAppConversation,
+        contact_phone: str,
+        contact_id: uuid.UUID,
+    ) -> bool:
+        """La opción "estado de mi pedido": el pedido más reciente, en una frase.
+
+        **No pasa por el gate de pedido vivo de las FAQs**, y es deliberado: ése silencia una
+        pregunta general cuando hay un pedido en curso, pero aquí el pedido en curso es
+        exactamente lo que se viene a leer. La ventana es la de inactividad, la misma pregunta
+        de siempre contestada con el número que el dueño ya configuró.
+        """
+        settings = await self.settings_for(conversation.tenant_id)
+        since = datetime.now(UTC) - timedelta(hours=max(1, settings.idle_hours))
+        order = await self._repo.latest_order_for_contact(
+            conversation.tenant_id, contact_id, since=since
+        )
+        if order is None:
+            text = "No encuentro pedidos recientes hechos con este número."
+            if self._storefront_base_url:
+                link = await self.mint_store_link(conversation, settings)
+                text += f"\n\nPuedes hacer uno aquí:\n{link}"
+            return await self._send_and_record(conversation, contact_phone, text)
+
+        text = (
+            f"Tu pedido *{order_number(order.order_id)}* "
+            f"{customer_status_line(order)}. Total: {format_money(order.total)}."
+        )
+        return await self._send_and_record(conversation, contact_phone, text)
+
+    async def _hand_to_person(
+        self, conversation: WhatsAppConversation, contact_phone: str
+    ) -> bool:
+        """La opción "hablar con una persona": avisa y pasa el hilo a `human`.
+
+        Se marca `human` aunque no haya empleado asignado, igual que el traspaso del asistente:
+        el estado significa "esto lo atiende una persona", y quien la reclame desde la bandeja se
+        la queda. Dejarlo en `greeted` haría que el menú se ofreciera otra vez a quien ya pidió
+        una persona.
+        """
+        sent = await self._send_and_record(
+            conversation,
+            contact_phone,
+            "Con gusto, ya aviso a alguien del equipo. Te escriben por aquí.",
+        )
+        await self._repo.update_conversation_status(
+            conversation.tenant_id, conversation.id, STATUS_HUMAN
+        )
+        return sent
 
     # --- Enlace con token ----------------------------------------------------
     async def mint_store_link(
@@ -1092,6 +1347,39 @@ def _identity_values(identity: BusinessIdentity) -> dict[str, str]:
         "branch_phone": identity.branch_phone or "",
     }
     return {key: value for key, value in values.items() if value}
+
+
+def _menu_option(message: str) -> str | None:
+    """Qué opción del menú eligió el cliente, o None si no eligió ninguna.
+
+    El orden ES la decisión: **persona** primero, porque quien pide una persona ya decidió que el
+    bot no le sirve; después **estado**; y por último **pedido**. El orden importa por una sola
+    razón: "mi pedido" contiene "pedido", así que si se mirara "pedido" primero, quien pregunta
+    por el estado de su pedido recibiría el enlace de la carta —que es una respuesta peor que no
+    entenderlo—.
+
+    Los números se aceptan SÓLO cuando el mensaje entero es el número. Por palabra suelta
+    "2" aparecería en "quiero 2 hamburguesas" y "1" en "quiero 1 hamburguesa", y convertir eso en
+    una consulta de estado es peor que ignorarlo. Es la misma razón por la que el opt-in del
+    asistente compara el mensaje completo y no por subcadena.
+
+    `asks_for_a_person` cubre además cancelar y devolver: esas frases no las resuelve ni el menú,
+    así que van a una persona, igual que en el asistente.
+    """
+    if asks_for_a_person(message):
+        return MENU_OPTION_PERSON
+    numeric = normalize(message)
+    if numeric == "1":
+        return MENU_OPTION_ORDER
+    if numeric == "2":
+        return MENU_OPTION_STATUS
+    if numeric == "3":
+        return MENU_OPTION_PERSON
+    if any(matches(word, message) for word in _OPTION_STATUS_WORDS):
+        return MENU_OPTION_STATUS
+    if any(matches(word, message) for word in _OPTION_ORDER_WORDS):
+        return MENU_OPTION_ORDER
+    return None
 
 
 def _validate_faqs(faqs: list[FaqEntry]) -> None:

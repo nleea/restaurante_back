@@ -92,6 +92,9 @@ from restaurante.modules.menu.infrastructure.models import (
     ProductPriceModel,
     ProductVariantModel,
 )
+from restaurante.modules.messaging.infrastructure.models import (
+    WhatsAppAutoreplySettingsModel,
+)
 from restaurante.modules.orders.infrastructure.models import (
     DiningTableModel,
     OrderItemModel,
@@ -2062,6 +2065,21 @@ Recorrido de «mi pedido» (pnpm dev en front/, uvicorn en backend/):
 
 
 # --- orchestrator -------------------------------------------------------------
+async def seed_whatsapp_autoreply(session: AsyncSession, tenant_id: Any) -> None:
+    """Enciende el canal de WhatsApp del demo: saludo y menú de opciones.
+
+    Es un dataset de DEMOSTRACIÓN, así que aquí sí se encienden los automatismos —el producto
+    los trae apagados a propósito, para que instalarlos no le cambie el canal a nadie—. El menú
+    es lo que enseña que un mensaje no entendido ya no se queda en silencio.
+    """
+    row, _ = await get_or_create(
+        session, WhatsAppAutoreplySettingsModel, tenant_id=tenant_id
+    )
+    row.greeting_enabled = True
+    row.menu_enabled = True
+    await session.flush()
+
+
 async def seed_demo(slug: str = DEMO_SLUG, tenant_name: str | None = None) -> None:
     tenant_name = tenant_name or f"{slug.title()} Restaurant"
     admin = admin_email_for(slug)
@@ -2153,6 +2171,7 @@ async def seed_demo(slug: str = DEMO_SLUG, tenant_name: str | None = None) -> No
             waiter,
         )
         await seed_finance(session, tenant.id, branch.id, cashier)
+        await seed_whatsapp_autoreply(session, tenant.id)
 
         await session.commit()
         branch_code = branch.code

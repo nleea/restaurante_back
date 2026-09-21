@@ -277,6 +277,9 @@ class AutoreplySettingsSchema(BaseModel):
     # Tercera variante, para el contacto con un pedido esperando pago. Vacía cae a las otras.
     greeting_awaiting_payment_text: str = Field(default="", max_length=MAX_REPLY_CHARS)
     assistant_offer_enabled: bool = False
+    # El menú de opciones que sale cuando el saludo, el asistente y las FAQs no contestaron.
+    menu_enabled: bool = False
+    menu_text: str = Field(default="", max_length=MAX_REPLY_CHARS)
     idle_hours: int = Field(default=24, ge=1, le=720)
     token_lifetime_hours: int = Field(default=24, ge=1, le=720)
     status_mapping: dict[str, StatusMessageSchema] = Field(default_factory=dict)
@@ -302,6 +305,8 @@ class AutoreplySettingsSchema(BaseModel):
             greeting_closed_text=settings.greeting_closed_text,
             greeting_awaiting_payment_text=settings.greeting_awaiting_payment_text,
             assistant_offer_enabled=settings.assistant_offer_enabled,
+            menu_enabled=settings.menu_enabled,
+            menu_text=settings.menu_text,
             idle_hours=settings.idle_hours,
             token_lifetime_hours=settings.token_lifetime_hours,
             status_mapping=mapping,
@@ -325,6 +330,8 @@ class AutoreplySettingsSchema(BaseModel):
             greeting_closed_text=self.greeting_closed_text,
             greeting_awaiting_payment_text=self.greeting_awaiting_payment_text,
             assistant_offer_enabled=self.assistant_offer_enabled,
+            menu_enabled=self.menu_enabled,
+            menu_text=self.menu_text,
             idle_hours=self.idle_hours,
             token_lifetime_hours=self.token_lifetime_hours,
             status_mapping={
@@ -357,6 +364,9 @@ class AutoreplyDefaultsResponse(BaseModel):
     order_placeholders: list[str]
     faq_placeholders: list[str]
     awaiting_payment_placeholders: list[str]
+    menu_placeholders: list[str]
+    # El texto de fábrica del menú, para el editor: el campo vacío significa "usa éste".
+    default_menu_text: str = ""
     # Si el asistente conversacional existe. Falso hasta `assistant-core`, y la pantalla lo
     # usa para deshabilitar la oferta: un saludo no puede anunciar algo que no va a contestar.
     assistant_available: bool = False

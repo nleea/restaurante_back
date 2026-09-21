@@ -255,7 +255,7 @@ class MessagingService:
         await self._publish(session.tenant_id, session.branch_id, conversation.id)
         # El saludo va DESPUÉS de guardar y avisar: el mensaje del cliente ya está a salvo,
         # así que un fallo aquí cuesta un saludo, nunca el mensaje.
-        await self._greet(conversation, contact.phone)
+        greeted_now = await self._greet(conversation, contact.phone)
         # Y después del saludo, por si a esta conversación le toca el asistente.
         #
         # El orden importa y es sutil: `conversation` se leyó ANTES de saludar, así que si el
@@ -270,7 +270,24 @@ class MessagingService:
             # Sólo si el asistente no era el dueño de este mensaje. Los dos caminos son casi
             # disjuntos —el asistente atiende `bot` y el opt-in; las FAQs, `greeted` a secas—,
             # pero preguntarlo aquí es lo que garantiza que nadie reciba las dos cosas.
-            await self._answer_faq(conversation, contact.id, contact.phone, message.content)
+            handled = await self._answer_faq(
+                conversation, contact.id, contact.phone, message.content
+            )
+        if not handled:
+            # Y si nada contestó, la opción del menú que el cliente haya escrito. Va ANTES del
+            # menú: quien responde a un menú ya enviado no debe recibir el menú otra vez.
+            handled = await self._answer_menu_option(
+                conversation,
+                contact.id,
+                contact.phone,
+                message.content,
+                greeted_now=greeted_now,
+            )
+        if not handled:
+            # La red que evita el silencio: si el saludo, el asistente, las FAQs y las opciones
+            # no contestaron, sale (una vez) el menú. Antes de esto, un mensaje no entendido en
+            # una conversación `greeted` se quedaba mudo y el cliente lo leía como un desplante.
+            await self._send_menu(conversation, contact.phone, greeted_now=greeted_now)
         return message
 
     async def _attach_media(
@@ -329,14 +346,19 @@ class MessagingService:
 
     async def _greet(
         self, conversation: WhatsAppConversation, contact_phone: str
-    ) -> None:
-        """Saludo automático, si está encendido. Nunca hace fallar la recepción."""
+    ) -> bool:
+        """Saludo automático, si está encendido. Nunca hace fallar la recepción.
+
+        Devuelve si saludó: el menú de opciones usa ese hecho para no sumarse al saludo en el
+        mismo entrante.
+        """
         if self._autoreply is None:
-            return
+            return False
         try:
-            await self._autoreply.greet_if_new(conversation, contact_phone)
+            return await self._autoreply.greet_if_new(conversation, contact_phone)
         except Exception:  # noqa: BLE001 - un saludo perdido no puede costar el mensaje
             logger.warning("El saludo automático falló", exc_info=True)
+            return False
 
     async def _assist(
         self,
@@ -368,21 +390,69 @@ class MessagingService:
         contact_id: uuid.UUID,
         contact_phone: str,
         text: str,
-    ) -> None:
+    ) -> bool:
         """Contesta una pregunta conocida, si alguna coincide. Nunca cuesta el mensaje.
 
         Es el tercer mecanismo automático del canal y el único que lee lo que el cliente
         escribió. Las dos puertas que lo hacen defendible viven en `AutoreplyService.answer_faq`;
         aquí sólo se garantiza que nada de esto pueda tumbar la recepción.
+
+        Devuelve si contestó: si no, el pipeline deja pasar el mensaje al menú de opciones.
         """
         if self._autoreply is None:
-            return
+            return False
         try:
-            await self._autoreply.answer_faq(
+            return await self._autoreply.answer_faq(
                 conversation, contact_phone, contact_id, text
             )
         except Exception:  # noqa: BLE001 - una FAQ perdida no puede costar el mensaje
             logger.warning("La respuesta por palabra clave falló", exc_info=True)
+            return False
+
+    async def _answer_menu_option(
+        self,
+        conversation: WhatsAppConversation,
+        contact_id: uuid.UUID,
+        contact_phone: str,
+        text: str,
+        *,
+        greeted_now: bool,
+    ) -> bool:
+        """Resuelve la opción de menú que el cliente escribió, si alguna. `True` si contestó.
+
+        Igual que la FAQ: un fallo cuenta como "no era esto" y deja pasar el mensaje al menú.
+        """
+        if self._autoreply is None:
+            return False
+        try:
+            return await self._autoreply.answer_menu_option(
+                conversation, contact_phone, contact_id, text, greeted_now=greeted_now
+            )
+        except Exception:  # noqa: BLE001 - una opción perdida no puede costar el mensaje
+            logger.warning("La respuesta de la opción del menú falló", exc_info=True)
+            return False
+
+    async def _send_menu(
+        self,
+        conversation: WhatsAppConversation,
+        contact_phone: str,
+        *,
+        greeted_now: bool,
+    ) -> None:
+        """Manda el menú de opciones como último recurso. Nunca cuesta el mensaje.
+
+        Es la red que evita el silencio en una conversación abierta. Las condiciones —una vez
+        por conversación, sólo `new`/`greeted`, negocio abierto— viven en
+        `AutoreplyService.send_options_menu`; aquí sólo se protege la recepción.
+        """
+        if self._autoreply is None:
+            return
+        try:
+            await self._autoreply.send_options_menu(
+                conversation, contact_phone, greeted_now=greeted_now
+            )
+        except Exception:  # noqa: BLE001 - un menú perdido no puede costar el mensaje
+            logger.warning("El menú de opciones falló", exc_info=True)
 
     async def _publish(
         self, tenant_id: uuid.UUID, branch_id: uuid.UUID, conversation_id: uuid.UUID
