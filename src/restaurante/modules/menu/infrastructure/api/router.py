@@ -501,8 +501,20 @@ async def save_appearance(
     service: AppearanceServiceDep,
     tenant_id: TenantDep,
 ) -> MenuAppearanceConfigSchema:
-    """Validate + upsert the tenant's single appearance row; returns the saved config."""
-    saved = await service.save_appearance(
-        tenant_id, payload.model_dump(by_alias=True)
-    )
+    """Validate + upsert the tenant's single appearance row; returns the saved config.
+
+    The payment QR is owned by ``/business/profile``: an incoming brand that omits
+    or empties ``paymentQrUrl`` keeps the stored one instead of erasing it.
+    """
+    data = payload.model_dump(by_alias=True)
+    brand = data.get("brand")
+    if isinstance(brand, dict) and not brand.get("paymentQrUrl"):
+        current = await service.get_appearance(tenant_id)
+        current_brand = current.get("brand") if isinstance(current, dict) else None
+        stored_qr = (
+            current_brand.get("paymentQrUrl") if isinstance(current_brand, dict) else None
+        )
+        if stored_qr:
+            brand["paymentQrUrl"] = stored_qr
+    saved = await service.save_appearance(tenant_id, data)
     return MenuAppearanceConfigSchema.model_validate(saved)

@@ -42,6 +42,7 @@ def default_appearance_config() -> dict[str, Any]:
             "logoUrl": "",
             "bannerUrl": "",
             "restaurantName": "",
+            "paymentQrUrl": "",
         },
         "blocks": [
             _block("banner", True, 0, 0, "large"),

@@ -167,6 +167,47 @@ async def test_update_profile_photo_writes_shared_brand_logo(
     assert profile.photo_url == photo
 
 
+async def test_update_profile_payment_qr_reaches_storefront(
+    client: AsyncClient,
+) -> None:
+    """Regression: the QR saved from the Business profile must survive the shared
+    appearance schema and be served by the public checkout endpoint."""
+    from restaurante.modules.menu.application.use_cases.manage_appearance import (
+        AppearanceService,
+    )
+    from restaurante.modules.menu.infrastructure.repositories import (
+        SqlAlchemyMenuRepository,
+    )
+
+    tenant_id = await demo_tenant_id()
+    await seed_primary_branch()
+    qr = "https://cdn.example.com/qr/nequi.png"
+    async with SessionFactory() as session:
+        svc = BusinessService(
+            repo=SqlAlchemyBusinessRepository(session),
+            appearance=AppearanceService(repo=SqlAlchemyMenuRepository(session)),
+        )
+        await svc.update_profile(
+            tenant_id,
+            name="Negocio",
+            tax_id=None,
+            email=None,
+            phone=None,
+            branches=[],
+            payment_qr_url=qr,
+        )
+
+    # The admin profile read reflects it...
+    async with SessionFactory() as session:
+        profile = await _svc(session).get_profile(tenant_id)
+    assert profile.payment_qr_url == qr
+
+    # ...and the public storefront (what the checkout consumes) does too.
+    resp = await client.get("/storefront/appearance")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["brand"]["paymentQrUrl"] == qr
+
+
 # --- Public storefront hours -----------------------------------------------
 async def test_storefront_hours_closed_when_no_hours(client: AsyncClient) -> None:
     await seed_primary_branch()

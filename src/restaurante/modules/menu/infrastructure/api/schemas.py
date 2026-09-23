@@ -177,6 +177,7 @@ class BrandSchema(_CamelModel):
     logo_url: str
     banner_url: str
     restaurant_name: str
+    payment_qr_url: str | None = None
 
 
 class GridPositionSchema(_CamelModel):

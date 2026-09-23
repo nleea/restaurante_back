@@ -39,3 +39,19 @@ async def test_appearance_unauthenticated_returns_saved(client: AsyncClient) -> 
     body = resp.json()
     assert body["brand"]["restaurantName"] == "La Cevichería del Cabo"
     assert body["theme"]["primaryColor"] == "#b5432b"
+
+
+async def test_appearance_returns_payment_qr(client: AsyncClient) -> None:
+    """The checkout reads ``brand.paymentQrUrl`` from this endpoint; it must survive."""
+    tenant_id = await demo_tenant_id()
+    qr = "https://cdn.example.com/qr/nequi.png"
+    config = default_appearance_config()
+    config["brand"]["paymentQrUrl"] = qr
+    async with SessionFactory() as session:
+        await AppearanceService(SqlAlchemyMenuRepository(session)).save_appearance(
+            tenant_id, config
+        )
+
+    resp = await client.get("/storefront/appearance")
+    assert resp.status_code == 200
+    assert resp.json()["brand"]["paymentQrUrl"] == qr

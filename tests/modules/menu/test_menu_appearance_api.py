@@ -117,6 +117,76 @@ async def test_put_creates_then_overwrites_single_row(client: AsyncClient) -> No
     assert count == 1
 
 
+# --- Payment QR survives the shared appearance round-trip -------------------
+async def test_payment_qr_round_trips_through_menu_appearance(
+    client: AsyncClient,
+) -> None:
+    """Regression: ``BrandSchema`` dropped ``paymentQrUrl`` on validate, so GET never
+    returned it and a later PUT (carta publish) overwrote the stored QR with null."""
+    await _assign_role("admin")
+    headers = await _login(client)
+
+    qr = "https://cdn.example.com/qr/nequi.png"
+    config = _valid_config()
+    config["brand"]["paymentQrUrl"] = qr
+
+    put = await client.put("/menu/appearance", headers=headers, json=config)
+    assert put.status_code == 200, put.text
+    assert put.json()["brand"]["paymentQrUrl"] == qr
+
+    got = await client.get("/menu/appearance", headers=headers)
+    assert got.status_code == 200, got.text
+    assert got.json()["brand"]["paymentQrUrl"] == qr
+
+
+async def test_put_without_payment_qr_preserves_stored_qr(
+    client: AsyncClient,
+) -> None:
+    """Regression: publishing the carta with a brand that omits/empties
+    ``paymentQrUrl`` must not erase the QR uploaded from /business/profile."""
+    await _assign_role("admin")
+    headers = await _login(client)
+
+    qr = "https://cdn.example.com/qr/nequi.png"
+    config = _valid_config()
+    config["brand"]["paymentQrUrl"] = qr
+    assert (await client.put("/menu/appearance", headers=headers, json=config)).status_code == 200
+
+    # Omitted.
+    omitted = _valid_config()
+    omitted["brand"].pop("paymentQrUrl", None)
+    omitted["brand"]["restaurantName"] = "Otro nombre"
+    put = await client.put("/menu/appearance", headers=headers, json=omitted)
+    assert put.status_code == 200, put.text
+    assert put.json()["brand"]["paymentQrUrl"] == qr
+    assert put.json()["brand"]["restaurantName"] == "Otro nombre"
+
+    # Empty string.
+    emptied = _valid_config()
+    emptied["brand"]["paymentQrUrl"] = ""
+    assert (await client.put("/menu/appearance", headers=headers, json=emptied)).status_code == 200
+
+    got = await client.get("/menu/appearance", headers=headers)
+    assert got.json()["brand"]["paymentQrUrl"] == qr
+
+
+async def test_put_with_new_payment_qr_replaces_stored_qr(
+    client: AsyncClient,
+) -> None:
+    await _assign_role("admin")
+    headers = await _login(client)
+
+    old, new = "https://cdn.example.com/qr/old.png", "https://cdn.example.com/qr/new.png"
+    config = _valid_config()
+    config["brand"]["paymentQrUrl"] = old
+    assert (await client.put("/menu/appearance", headers=headers, json=config)).status_code == 200
+
+    config["brand"]["paymentQrUrl"] = new
+    put = await client.put("/menu/appearance", headers=headers, json=config)
+    assert put.status_code == 200, put.text
+    assert put.json()["brand"]["paymentQrUrl"] == new
+
+
 # --- Tenancy isolation ------------------------------------------------------
 async def test_appearance_isolated_by_tenant(setup_db: None) -> None:
     tenant_a, _ = await _demo_ids()
