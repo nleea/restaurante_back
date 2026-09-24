@@ -93,6 +93,7 @@ class GuardedWhatsAppGateway:
         bg_color: str | None = None,
         font: int | None = None,
         caption: str | None = None,
+        media_url: str | None = None,
     ) -> str | None:
         """Passthrough, y hay que explicar por qué no es un olvido.
 
@@ -119,6 +120,7 @@ class GuardedWhatsAppGateway:
             bg_color=bg_color,
             font=font,
             caption=caption,
+            media_url=media_url,
         )
 
     async def fetch_media(

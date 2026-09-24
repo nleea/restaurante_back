@@ -621,6 +621,7 @@ class WhatsAppGateway(Protocol):
         bg_color: str | None = None,
         font: int | None = None,
         caption: str | None = None,
+        media_url: str | None = None,
     ) -> str | None:
         """Publica un estado dirigido a `jids` y devuelve el id que el proveedor acepte.
 
@@ -634,7 +635,9 @@ class WhatsAppGateway(Protocol):
         entrante en esa sede. Aquí no hay a quién preguntarle `is_reachable`, porque no hay un
         destinatario — hay una lista.
 
-        `content` es el texto de la tarjeta o la URL de la imagen. `bg_color` y `font` son
+        `content` es el texto de la tarjeta (o el pie de la imagen). `media_url` es la URL de la
+        imagen cuando `status_type` es imagen; si falta, el adaptador cae a `content` por
+        compatibilidad con quien aún pasa la URL ahí. `bg_color` y `font` son
         obligatorios cuando `status_type` es texto: el proveedor devuelve 400 sin ellos. Se validan
         al GUARDAR el estado, no aquí, porque aquí ya no hay nadie mirando.
 

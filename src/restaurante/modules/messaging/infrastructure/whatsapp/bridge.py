@@ -134,6 +134,7 @@ class BridgeWhatsAppGateway:
         bg_color: str | None = None,
         font: int | None = None,
         caption: str | None = None,
+        media_url: str | None = None,
     ) -> str | None:
         """Evolution v2: `POST /message/sendStatus/{instance}`.
 
@@ -169,9 +170,15 @@ class BridgeWhatsAppGateway:
             # publicar a nadie no es un caso a soportar sino una llamada que sobra.
             raise MessageDeliveryError("Un estado necesita al menos un destinatario.")
 
+        # Para una imagen, `content` es la URL del archivo y el pie va aparte en `caption`. El
+        # `content` recibido queda como respaldo para quien aún pase la URL por ahí.
+        # Payload de texto (`content` + `backgroundColor` + `font`) según el `SendStatusDto` leído
+        # del código de Evolution v2 (ver docstring). PENDIENTE: contrastarlo con la instancia
+        # desplegada (spike manual); sin acceso a ella no se cambió el mapeo de campos.
+        payload_content = (media_url or content) if status_type == "image" else content
         payload: dict[str, Any] = {
             "type": status_type,
-            "content": content,
+            "content": payload_content,
             "statusJidList": jids,
         }
         if bg_color is not None:
@@ -184,16 +191,37 @@ class BridgeWhatsAppGateway:
         data = await self._request(
             "POST", f"/message/sendStatus/{session.provider_instance_ref}", json=payload
         )
+        if _has_error_body(data):
+            # Un 2xx con cuerpo de error es un rechazo disfrazado: registrarlo como `published`
+            # escondería justo el fallo que hay que diagnosticar. Se traduce igual que un 4xx para
+            # que quien llama lo marque `failed`.
+            logger.warning(
+                "El puente respondió 2xx al estado con cuerpo de error "
+                "(tenant=%s, branch=%s, type=%s, body=%.200s)",
+                session.tenant_id,
+                session.branch_id,
+                status_type,
+                data,
+            )
+            raise MessageDeliveryError(
+                "El puente de WhatsApp devolvió un error al publicar el estado."
+            )
         # A diferencia de un mensaje, aquí el id es prescindible: sirve para correlacionar, no para
         # reconciliar nada —un estado no tiene acuses que emparejar—. `_extract_message_id` devuelve
         # cadena vacía cuando no lo encuentra; se traduce a `None` porque "no lo sabemos" y "es la
         # cadena vacía" son cosas distintas, y la columna es nullable justamente para poder decirlo.
         message_id = _extract_message_id(data)
         if not message_id:
-            logger.info(
-                "El puente aceptó el estado sin devolver id (tenant=%s, branch=%s)",
+            # Un 2xx sin id y sin error NO es un éxito limpio: Evolution responde 2xx aun cuando
+            # una tanda falló (`Promise.allSettled`). No podemos distinguirlo desde aquí, así que
+            # se deja el rastro para diagnosticar un "publicado" que no aparece.
+            logger.warning(
+                "El puente respondió 2xx al estado sin id de mensaje; puede no haberse publicado "
+                "(tenant=%s, branch=%s, type=%s, body=%.200s)",
                 session.tenant_id,
                 session.branch_id,
+                status_type,
+                data,
             )
             return None
         return message_id
@@ -381,6 +409,15 @@ def _safe_json(response: httpx.Response) -> dict[str, Any]:
     except ValueError:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _has_error_body(data: dict[str, Any]) -> bool:
+    """True si un 2xx trae la forma de error de Evolution (`{status, error, response}`).
+
+    Manda `error`, no `status`: un `status` suelto también puede venir en un éxito, y leerlo solo
+    marcaría `failed` un estado que sí salió.
+    """
+    return bool(data.get("error"))
 
 
 def _extract_message_id(data: dict[str, Any]) -> str:

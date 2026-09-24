@@ -106,6 +106,27 @@ def to_jid(address: str) -> str:
     return f"{normalize_phone(address)}{WHATSAPP_JID_SUFFIX}"
 
 
+def with_own_jid(jids: list[str], own_phone: str | None) -> list[str]:
+    """La lista que se ENVÍA: la audiencia más el número propio de la sesión, al frente.
+
+    Evolution sólo manda el estado a los JIDs de `statusJidList`, y eso incluye al propio
+    teléfono: sin su JID en la lista, "Mi estado" del restaurante queda vacío aunque el puente
+    devuelva 201. Por eso se agrega aquí, y por eso es una lista aparte de `StatusAudience.jids` —
+    el número propio no es un destinatario, así que no cuenta en `addressed_count` ni en el tope.
+
+    Sin número (`None` o un `@lid`) devuelve la audiencia tal cual; nunca se duplica.
+    """
+    if not own_phone:
+        return list(jids)
+    if is_privacy_jid(own_phone):
+        if not own_phone.endswith(WHATSAPP_JID_SUFFIX):
+            return list(jids)
+        own = own_phone
+    else:
+        own = to_jid(own_phone)
+    return [own, *(jid for jid in jids if jid != own)]
+
+
 def effective_cap(configured_cap: int) -> int:
     """El tope que de verdad aplica: el ajuste, pero nunca por encima del techo del dominio.
 

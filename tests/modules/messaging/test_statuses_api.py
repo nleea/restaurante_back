@@ -98,6 +98,28 @@ async def test_a_text_card_without_a_font_is_refused(
 
 
 @pytest.mark.asyncio
+async def test_a_text_card_with_font_zero_is_refused(
+    client: AsyncClient, screen: dict[str, Any]
+) -> None:
+    """El 0 es "sin fuente" para Evolution (`if (!status.font)`): 400 al publicar."""
+    response = await _post(client, screen, _card(font=0))
+
+    assert response.status_code == 422
+    assert "fuente" in response.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_a_text_card_with_a_font_outside_the_catalogue_is_refused(
+    client: AsyncClient, screen: dict[str, Any]
+) -> None:
+    """El 3 no existe en `FontType`: no fallaría, se vería en otra letra."""
+    response = await _post(client, screen, _card(font=3))
+
+    assert response.status_code == 422
+    assert "fuente" in response.text.lower()
+
+
+@pytest.mark.asyncio
 async def test_an_image_status_needs_neither(
     client: AsyncClient, screen: dict[str, Any]
 ) -> None:
@@ -106,7 +128,8 @@ async def test_an_image_status_needs_neither(
         screen,
         _card(
             type="image",
-            content="https://cdn.test/menu.jpg",
+            content="Menú del día",
+            media_url="https://cdn.test/menu.jpg",
             caption="Menú del día",
             bg_color=None,
             font=None,
@@ -115,6 +138,19 @@ async def test_an_image_status_needs_neither(
 
     assert response.status_code == 201
     assert response.json()["caption"] == "Menú del día"
+
+
+@pytest.mark.asyncio
+async def test_an_image_status_without_the_uploaded_image_is_refused(
+    client: AsyncClient, screen: dict[str, Any]
+) -> None:
+    response = await _post(
+        client,
+        screen,
+        _card(type="image", content="Menú del día", bg_color=None, font=None),
+    )
+
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio
