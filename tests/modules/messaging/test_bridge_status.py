@@ -118,6 +118,112 @@ async def test_an_image_status_travels_as_a_url_with_its_caption() -> None:
     assert "font" not in seen["payload"]
 
 
+async def test_an_image_status_sends_media_url_as_content_and_keeps_the_caption_apart() -> None:
+    """`content` del use case es el pie; la URL viaja aparte y es la que va como `content`."""
+    seen: dict[str, Any] = {}
+    gateway = _gateway(_capture(seen))
+
+    await gateway.publish_status(
+        SESSION,
+        JIDS,
+        status_type="image",
+        content="Menú del día",
+        caption="Menú del día",
+        media_url="https://cdn.test/abc.jpg",
+    )
+
+    assert seen["payload"]["content"] == "https://cdn.test/abc.jpg"
+    assert seen["payload"]["caption"] == "Menú del día"
+
+
+async def test_media_url_is_ignored_for_a_text_status() -> None:
+    seen: dict[str, Any] = {}
+    gateway = _gateway(_capture(seen))
+
+    await gateway.publish_status(
+        SESSION,
+        JIDS,
+        status_type="text",
+        content="Hoy hay sancocho",
+        bg_color="#000",
+        font=1,
+        media_url="https://cdn.test/abc.jpg",
+    )
+
+    assert seen["payload"]["content"] == "Hoy hay sancocho"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"status": 400, "error": "Bad Request"},
+        {"error": "Font is required"},
+        {"status": 500, "error": True},
+    ],
+)
+async def test_a_2xx_with_an_error_body_becomes_a_delivery_error(
+    body: dict[str, Any],
+) -> None:
+    """Un rechazo disfrazado de 2xx no puede quedar como `published`."""
+    gateway = _gateway(_capture({}, body=body))
+
+    with pytest.raises(MessageDeliveryError):
+        await gateway.publish_status(
+            SESSION, JIDS, status_type="text", content="x", bg_color="#000", font=1
+        )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"status": 200, "key": {"id": "st-1"}},
+        {"status": 500, "key": {"id": "st-1"}},
+        {"error": None, "key": {"id": "st-1"}},
+    ],
+)
+async def test_a_success_carrying_a_status_field_is_not_a_failure(
+    body: dict[str, Any],
+) -> None:
+    """Manda `error`, no `status`: un `status` suelto en un éxito no marca `failed`."""
+    gateway = _gateway(_capture({}, body=body))
+
+    result = await gateway.publish_status(
+        SESSION, JIDS, status_type="text", content="x", bg_color="#000", font=1
+    )
+
+    assert result == "st-1"
+
+
+async def test_a_2xx_without_a_message_id_is_warned_about(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Un 2xx sin id no es un éxito limpio: sigue devolviendo None, pero deja un warning."""
+    gateway = _gateway(_capture({}, body={"ok": True}))
+
+    with caplog.at_level("WARNING"):
+        result = await gateway.publish_status(
+            SESSION, JIDS, status_type="text", content="x", bg_color="#000", font=1
+        )
+
+    assert result is None
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "sin id" in warnings[0].getMessage()
+
+
+async def test_a_2xx_with_a_message_id_does_not_warn(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    gateway = _gateway(_capture({}))
+
+    with caplog.at_level("WARNING"):
+        await gateway.publish_status(
+            SESSION, JIDS, status_type="text", content="x", bg_color="#000", font=1
+        )
+
+    assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+
+
 async def test_a_rejection_becomes_a_delivery_error() -> None:
     seen: dict[str, Any] = {}
     gateway = _gateway(_capture(seen, status=400, body={"message": "Font is required"}))

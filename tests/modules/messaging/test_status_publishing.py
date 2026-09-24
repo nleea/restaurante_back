@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient
+from sqlalchemy import update
 
 from restaurante.modules.messaging.application.use_cases import statuses as sut
 from restaurante.modules.messaging.application.use_cases.statuses import StatusService
@@ -32,11 +33,13 @@ from restaurante.modules.messaging.infrastructure.models import (
     PUBLICATION_PUBLISHED,
     PUBLICATION_SKIPPED_EMPTY,
     PUBLICATION_SKIPPED_LATE,
+    WhatsAppSessionModel,
 )
 from restaurante.modules.messaging.infrastructure.repositories import (
     SqlAlchemyMessagingRepository,
 )
 from restaurante.shared.database import SessionFactory
+from restaurante.shared.domain.errors import ValidationError
 
 from .conftest import create_branch, create_session_row, demo_tenant_id, post_inbound
 
@@ -63,11 +66,18 @@ class RecordingGateway:
         bg_color: str | None = None,
         font: int | None = None,
         caption: str | None = None,
+        media_url: str | None = None,
     ) -> str | None:
         if self._fail:
             raise MessageDeliveryError("el puente dijo no")
         self.calls.append(
-            {"jids": list(jids), "type": status_type, "content": content}
+            {
+                "jids": list(jids),
+                "type": status_type,
+                "content": content,
+                "caption": caption,
+                "media_url": media_url,
+            }
         )
         return f"st-{len(self.calls)}"
 
@@ -353,13 +363,154 @@ async def test_an_empty_audience_is_its_own_outcome(
 async def test_the_audience_that_reaches_the_bridge_is_a_full_jid(
     branch_with_audience: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """La audiencia viaja como JID completo, con el número propio de la sesión al frente."""
     ctx = branch_with_audience
     await _create(ctx, [StatusSlot(minute=ELEVEN, weekday=0)])
     gateway = RecordingGateway()
 
     await _sweep(monkeypatch, _at(MONDAY, ELEVEN), gateway)
 
+    assert gateway.calls[0]["jids"] == [
+        "573000000000@s.whatsapp.net",
+        "573001112233@s.whatsapp.net",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_own_number_is_sent_but_not_counted_as_addressed(
+    branch_with_audience: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sin el JID propio "Mi estado" queda vacío; pero no es un destinatario para la auditoría."""
+    ctx = branch_with_audience
+    status_id = await _create(ctx, [StatusSlot(minute=ELEVEN, weekday=0)])
+    gateway = RecordingGateway()
+
+    await _sweep(monkeypatch, _at(MONDAY, ELEVEN), gateway)
+
+    assert "573000000000@s.whatsapp.net" in gateway.calls[0]["jids"]
+    [publication] = await _publications(ctx, status_id)
+    assert publication.state == PUBLICATION_PUBLISHED
+    assert publication.addressed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_session_without_its_own_number_still_publishes(
+    branch_with_audience: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = branch_with_audience
+    async with SessionFactory() as db:
+        await db.execute(
+            update(WhatsAppSessionModel)
+            .where(WhatsAppSessionModel.branch_id == ctx["branch_id"])
+            .values(phone_number=None)
+        )
+        await db.commit()
+    status_id = await _create(ctx, [StatusSlot(minute=ELEVEN, weekday=0)])
+    gateway = RecordingGateway()
+
+    await _sweep(monkeypatch, _at(MONDAY, ELEVEN), gateway)
+
     assert gateway.calls[0]["jids"] == ["573001112233@s.whatsapp.net"]
+    assert [p.state for p in await _publications(ctx, status_id)] == [
+        PUBLICATION_PUBLISHED
+    ]
+
+
+@pytest.mark.parametrize("font", [None, 0, -1])
+def test_a_text_status_without_a_usable_font_is_rejected_on_save(
+    font: int | None,
+) -> None:
+    """El 0 cuenta como "sin fuente": Evolution valida con `if (!status.font)`."""
+    with pytest.raises(ValidationError):
+        sut.validate_composition("text", content="Hola", bg_color="#000", font=font)
+
+
+@pytest.mark.parametrize("font", sorted(sut.STATUS_FONTS))
+def test_the_fonts_the_provider_publishes_are_accepted(font: int) -> None:
+    sut.validate_composition("text", content="Hola", bg_color="#000", font=font)
+
+
+@pytest.mark.parametrize("font", [3, 4, 5, 6])
+def test_a_font_outside_the_catalogue_is_rejected_on_save(font: int) -> None:
+    """3–5 no existen en `FontType`; el 6 existe pero Evolution lo rechaza (acepta de 0 a 5)."""
+    with pytest.raises(ValidationError):
+        sut.validate_composition("text", content="Hola", bg_color="#000", font=font)
+
+
+def test_the_font_catalogue_is_normal_and_handwriting() -> None:
+    """`SYSTEM_TEXT=1` y `FB_SCRIPT=2`: debe coincidir con `FONTS` del frontend."""
+    assert sut.STATUS_FONTS == frozenset({1, 2})
+
+
+@pytest.mark.asyncio
+async def test_an_image_status_forwards_its_media_url_to_the_gateway(
+    branch_with_audience: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = branch_with_audience
+    service, session = await _service(RecordingGateway())
+    async with session:
+        await service.create_status(
+            ctx["tenant_id"],
+            ctx["branch_id"],
+            status_type="image",
+            content="Menú del día",
+            slots=[StatusSlot(minute=ELEVEN, weekday=0)],
+            caption="Menú del día",
+            media_url="https://cdn.test/abc.jpg",
+        )
+    gateway = RecordingGateway()
+
+    await _sweep(monkeypatch, _at(MONDAY, ELEVEN), gateway)
+
+    assert len(gateway.calls) == 1
+    assert gateway.calls[0]["media_url"] == "https://cdn.test/abc.jpg"
+    assert gateway.calls[0]["caption"] == "Menú del día"
+
+
+def test_an_image_without_media_url_is_rejected_on_save() -> None:
+    with pytest.raises(ValidationError):
+        sut.validate_composition(
+            "image", content="Menú", bg_color=None, font=None, media_url=None
+        )
+    sut.validate_composition(
+        "image",
+        content="Menú",
+        bg_color=None,
+        font=None,
+        media_url="https://cdn.test/abc.jpg",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_status", ["disconnected", "qr_pending"])
+async def test_a_stale_session_status_does_not_block_the_publish(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch, session_status: str
+) -> None:
+    branch_id = await create_branch("centro", primary=True)
+    session_id = await create_session_row(branch_id, "inst-centro")
+    # Un mensaje entrante marca la sesión como conectada, así que se degrada DESPUÉS de crear la
+    # audiencia.
+    await post_inbound(client, "inst-centro", message_id="a1", phone="+573001112233")
+    async with SessionFactory() as db:
+        await db.execute(
+            update(WhatsAppSessionModel)
+            .where(WhatsAppSessionModel.id == session_id)
+            .values(status=session_status)
+        )
+        await db.commit()
+    ctx = {"branch_id": branch_id, "tenant_id": await demo_tenant_id()}
+    status_id = await _create(ctx, [StatusSlot(minute=ELEVEN, weekday=0)])
+    gateway = RecordingGateway()
+
+    outcome = await _sweep(monkeypatch, _at(MONDAY, ELEVEN), gateway)
+
+    # `whatsapp_sessions.status` sólo lo mueve el webhook y puede ir atrasado: el puente decide,
+    # no la copia local. Si el número de verdad está caído, el puente lo dice y queda `failed`.
+    assert len(gateway.calls) == 1
+    assert outcome.published == 1
+    assert [p.state for p in await _publications(ctx, status_id)] == [
+        PUBLICATION_PUBLISHED
+    ]
 
 
 @pytest.mark.asyncio

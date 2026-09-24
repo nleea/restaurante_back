@@ -28,6 +28,7 @@ from restaurante.modules.messaging.domain.status_audience import (
     publication_calls,
     resolve_audience,
     to_jid,
+    with_own_jid,
 )
 from restaurante.modules.messaging.infrastructure.models import (
     WhatsAppContactModel,
@@ -416,3 +417,37 @@ async def test_opting_out_an_unknown_contact_reports_it(
     async with SessionFactory() as session:
         repo = SqlAlchemyMessagingRepository(session)
         assert not await repo.set_status_opt_out(tenant_id, uuid.uuid4(), True)
+
+
+# --- El número propio en la lista enviada ----------------------------------
+AUDIENCE_JIDS = ["573001112233@s.whatsapp.net", "573002223344@s.whatsapp.net"]
+
+
+def test_the_own_number_goes_first_as_a_full_jid() -> None:
+    assert with_own_jid(AUDIENCE_JIDS, "+573000000000") == [
+        "573000000000@s.whatsapp.net",
+        *AUDIENCE_JIDS,
+    ]
+
+
+def test_the_own_number_is_never_duplicated() -> None:
+    jids = ["573001112233@s.whatsapp.net", "573000000000@s.whatsapp.net"]
+
+    assert with_own_jid(jids, "573000000000") == [
+        "573000000000@s.whatsapp.net",
+        "573001112233@s.whatsapp.net",
+    ]
+
+
+def test_an_own_number_already_given_as_a_jid_is_kept() -> None:
+    assert with_own_jid(AUDIENCE_JIDS, "573000000000@s.whatsapp.net")[0] == (
+        "573000000000@s.whatsapp.net"
+    )
+
+
+@pytest.mark.parametrize("own", [None, "", "12345@lid"])
+def test_without_a_usable_own_number_the_audience_goes_as_is(own: str | None) -> None:
+    result = with_own_jid(AUDIENCE_JIDS, own)
+
+    assert result == AUDIENCE_JIDS
+    assert result is not AUDIENCE_JIDS  # copia: no muta la audiencia auditada

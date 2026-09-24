@@ -45,6 +45,7 @@ from restaurante.modules.messaging.domain.ports import (
 from restaurante.modules.messaging.domain.status_audience import (
     StatusAudience,
     resolve_audience,
+    with_own_jid,
 )
 from restaurante.modules.messaging.domain.status_schedule import (
     DueSlot,
@@ -74,6 +75,13 @@ logger = logging.getLogger(__name__)
 #: El rango es irregular a propósito; un intervalo fijo también es una firma.
 JITTER_SECONDS = (1.5, 4.0)
 
+#: Las fuentes que el proveedor publica de verdad: la intersección de dos listas ajenas.
+#:
+#: Evolution valida `font` como entero de 0 a 5 y además hace `if (!status.font)`, así que el 0
+#: ("SYSTEM") cae. El número va tal cual a `ExtendedTextMessage.FontType` de Baileys, cuyo enum es
+#: `SYSTEM=0, SYSTEM_TEXT=1, FB_SCRIPT=2, SYSTEM_BOLD=6…` — no hay 3, 4 ni 5. Quedan dos.
+STATUS_FONTS = frozenset({1, 2})
+
 
 @dataclass(frozen=True)
 class SweepOutcome:
@@ -93,6 +101,7 @@ def validate_composition(
     content: str,
     bg_color: str | None,
     font: int | None,
+    media_url: str | None = None,
 ) -> None:
     """Rechaza al guardar lo que el proveedor rechazaría al publicar.
 
@@ -103,6 +112,8 @@ def validate_composition(
         raise ValidationError(f"Tipo de estado desconocido: {status_type}.")
     if not content.strip():
         raise ValidationError("Un estado necesita contenido.")
+    if status_type == STATUS_TYPE_IMAGE and not media_url:
+        raise ValidationError("Un estado de imagen necesita la imagen subida.")
     if status_type == STATUS_TYPE_TEXT:
         if not bg_color:
             raise ValidationError(
@@ -112,6 +123,9 @@ def validate_composition(
             raise ValidationError(
                 "Un estado de texto necesita una fuente: WhatsApp la exige."
             )
+        # Una lista cerrada, no `>= 1`: un número fuera del enum no falla, se ve en otra letra.
+        if font not in STATUS_FONTS:
+            raise ValidationError(f"Fuente desconocida: {font}.")
 
 
 class StatusService:
@@ -167,7 +181,11 @@ class StatusService:
         created_by: uuid.UUID | None = None,
     ) -> WhatsAppStatus:
         validate_composition(
-            status_type, content=content, bg_color=bg_color, font=font
+            status_type,
+            content=content,
+            bg_color=bg_color,
+            font=font,
+            media_url=media_url,
         )
         validate_slots(slots)
         status_id = await self._repo.create_status(
@@ -201,7 +219,11 @@ class StatusService:
     ) -> WhatsAppStatus:
         await self.get_status(tenant_id, branch_id, status_id)
         validate_composition(
-            status_type, content=content, bg_color=bg_color, font=font
+            status_type,
+            content=content,
+            bg_color=bg_color,
+            font=font,
+            media_url=media_url,
         )
         validate_slots(slots)
         await self._repo.update_status(
@@ -344,15 +366,24 @@ class StatusService:
             )
             return PUBLICATION_FAILED
 
+        if not session.phone_number:
+            # Publica igual, pero el teléfono del restaurante no verá su propio estado.
+            logger.warning(
+                "Estado %s sin número propio en la sesión de la sede %s: "
+                "no aparecerá en 'Mi estado'",
+                status.id,
+                status.branch_id,
+            )
         try:
             provider_id = await self._gateway.publish_status(
                 session,
-                audience.jids,
+                with_own_jid(audience.jids, session.phone_number),
                 status_type=status.type,
                 content=status.content,
                 bg_color=status.bg_color,
                 font=status.font,
                 caption=status.caption,
+                media_url=status.media_url,
             )
         except MessageDeliveryError as exc:
             logger.warning("El puente rechazó el estado %s: %s", status.id, exc)
